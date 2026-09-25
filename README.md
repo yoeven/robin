@@ -261,9 +261,12 @@ offer it as a separate next step. Source: [skills/robin/SKILL.md](skills/robin/S
 | Provider | `LLM_BASE_URL` | `LLM_MODEL` example |
 | --- | --- | --- |
 | **OpenRouter (free)** | `https://openrouter.ai/api/v1` | `openrouter/free` |
-| OpenAI | `https://api.openai.com/v1` | `gpt-4o` |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o`, `gpt-5-mini`, `o4-mini` |
+| Anthropic (Claude) | `https://api.anthropic.com/v1` | `claude-sonnet-4-5` |
 | Groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` |
 | Ollama (your server) | `http://YOUR_SERVER:11434/v1` | `llama3.2` |
+
+Anthropic works through its OpenAI-compatible endpoint with your regular Anthropic API key; pasting `https://api.anthropic.com` without `/v1` is fine too. OpenAI reasoning models (`o1`/`o3`/`o4-mini`, `gpt-5*`, `codex-*`) are sent without `temperature` and with `max_completion_tokens` automatically. See [Provider notes](docs/ADVANCED.md#provider-notes).
 
 GitHub’s servers cannot reach `localhost` on your laptop. For Ollama at home, use a public server, a tunnel, or a [self-hosted runner](docs/ADVANCED.md#save-github-actions-minutes).
 
@@ -292,7 +295,7 @@ Add `.github/code-reviewer.md` in your repo:
 | `Empty response from LLM` | Free routers sometimes return no text — the action retries automatically; comment `/robin` again |
 | `OpenRouter stall` / job runs 15 min with no review | Auto-router hung — action now aborts after 45s with no stream and retries | Watch Actions log for `LLM resolved model` (routing OK); pin `@v2` or `@main` for the fix |
 | `404 Provider returned error` | Normal for `openrouter/free` when one provider is down — the action retries up to 5 times; keep `LLM_MODEL=openrouter/free` |
-| `temperature` rejected / must be a fixed value | Some models accept only one temperature (Kimi requires `1`) — set `llm-temperature` in your workflow's `with:` block, see [docs/ADVANCED.md](docs/ADVANCED.md#models-that-require-a-fixed-temperature) |
+| `temperature` / `max_tokens` rejected by the model | The action warns, retries once without that parameter (or with `max_completion_tokens`), and keeps that shape for the run. To pin a value some models insist on (Kimi requires `1`), set `llm-temperature` in your workflow's `with:` block, see [docs/ADVANCED.md](docs/ADVANCED.md#models-that-require-a-fixed-temperature) |
 | `reasoning-effort` rejected as unsupported or invalid | The action warns, retries once with no reasoning override, and completes the review when that retry succeeds. Its final status comment tells you to update `reasoning-effort` in `.github/robin.yml` or the workflow `with:` block |
 
 More fixes: [docs/ADVANCED.md#troubleshooting](docs/ADVANCED.md#troubleshooting)

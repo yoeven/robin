@@ -8,7 +8,9 @@ import {
 import {
   computeRetryDelayMs,
   delayMs,
+  DroppableRequestParam,
   errorMessage,
+  findUnsupportedRequestParam,
   getLlmCompletionAttemptCount,
   isInvalidReasoningEffortError,
   isOpenRouterRouterModel,
@@ -18,6 +20,12 @@ import {
   resolveLlmTimeoutMs,
   shouldUseJsonResponseMode,
 } from "./llm-retry";
+import {
+  detectLlmProvider,
+  isOpenAIReasoningModel,
+  LlmProvider,
+  normalizeLlmBaseUrl,
+} from "./llm-provider";
 import { ReasoningFallbackReason } from "./reasoning-fallback";
 import * as core from "@actions/core";
 
@@ -28,13 +36,22 @@ export interface ChatCompletionResult {
 
 export type LlmProgressHandler = (detail: string) => void | Promise<void>;
 
-type OpenRouterReasoningRequest = {
+type ReasoningRequest = {
+  /** OpenRouter-style reasoning object (default shape). */
   reasoning?: { effort: string; exclude: boolean };
+  /** OpenAI-native reasoning control, sent only to api.openai.com. */
+  reasoning_effort?: string;
 };
+
+type ChatRequest = Omit<OpenAI.Chat.Completions.ChatCompletionCreateParams, "reasoning_effort"> &
+  ReasoningRequest;
+
+type TokenLimitParam = "max_tokens" | "max_completion_tokens";
 
 export class LLMClient {
   private client: OpenAI;
   private model: string;
+  private provider: LlmProvider;
   private maxOutputTokens?: number;
   private maxAttempts: number;
   private routerModel: boolean;
@@ -43,6 +60,11 @@ export class LLMClient {
   private reasoningEffort?: string;
   private reasoningFallbackActive = false;
   private reasoningFallbackReason?: ReasoningFallbackReason;
+  /** Request-shape compatibility state; adjusted once per rejected parameter and kept for the run. */
+  private sendTemperature = true;
+  private sendResponseFormat = true;
+  private tokenLimitParam: TokenLimitParam | undefined = "max_tokens";
+  private droppedParams: DroppableRequestParam[] = [];
 
   constructor(
     baseUrl: string,
@@ -67,13 +89,19 @@ export class LLMClient {
     this.maxAttempts = getLlmCompletionAttemptCount(maxAttempts, model);
     const effectiveTimeoutMs = resolveLlmTimeoutMs(model, timeoutMs);
 
+    const normalizedBaseUrl = normalizeLlmBaseUrl(baseUrl);
+    this.provider = detectLlmProvider(normalizedBaseUrl);
+    if (normalizedBaseUrl !== baseUrl.trim()) {
+      core.info(`Normalized LLM base URL: ${baseUrl} -> ${normalizedBaseUrl}`);
+    }
+
     core.info(
-      `Initializing LLM client: baseUrl=${baseUrl}, model=${model}, timeout=${effectiveTimeoutMs} ms, maxAttempts=${this.maxAttempts}, temperature=${this.temperature}`
+      `Initializing LLM client: baseUrl=${normalizedBaseUrl}, provider=${this.provider}, model=${model}, timeout=${effectiveTimeoutMs} ms, maxAttempts=${this.maxAttempts}, temperature=${this.temperature}`
     );
 
     // ponytail: chatCompletion owns retries; SDK maxRetries × 10-min timeout burned whole job budgets
     this.client = new OpenAI({
-      baseURL: baseUrl,
+      baseURL: normalizedBaseUrl,
       apiKey: apiKey || "ollama",
       maxRetries: 0,
       timeout: effectiveTimeoutMs,
@@ -84,6 +112,72 @@ export class LLMClient {
         `OpenRouter router model — ${DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS / 1000}s first-chunk stall detect, ${effectiveTimeoutMs / 1000}s stream cap, provider fallbacks.`
       );
     }
+
+    if (isOpenAIReasoningModel(model)) {
+      // o-series / GPT-5 / codex reject sampling controls and the legacy token cap outright.
+      this.sendTemperature = false;
+      this.tokenLimitParam = "max_completion_tokens";
+      core.info(
+        `OpenAI reasoning model detected — omitting temperature and using max_completion_tokens.`
+      );
+    }
+
+    if (this.provider === "anthropic") {
+      if (this.reasoningEffort) {
+        core.info(
+          "Anthropic's OpenAI-compatible endpoint ignores reasoning-effort controls; reasoning-effort is not sent. Claude decides its own thinking depth."
+        );
+      }
+      core.info(
+        "Anthropic endpoint: response_format is ignored by the provider, so JSON mode relies on the prompt and the markdown fallback parser."
+      );
+    }
+  }
+
+  /** Optional parameters the current request shape includes, in fallback-check order. */
+  private sentDroppableParams(request: ChatRequest): DroppableRequestParam[] {
+    const sent: DroppableRequestParam[] = [];
+    if (request.temperature !== undefined) sent.push("temperature");
+    if (request.max_tokens !== undefined) sent.push("max_tokens");
+    if (request.max_completion_tokens !== undefined) sent.push("max_completion_tokens");
+    if (request.response_format !== undefined) sent.push("response_format");
+    return sent;
+  }
+
+  /**
+   * Adjust the request shape once for a parameter the provider rejected. Returns true when
+   * the request should be rebuilt and re-sent. Each parameter can trigger at most one
+   * adjustment per client so normal retries are not multiplied.
+   */
+  private applyParameterFallback(error: unknown, request: ChatRequest): boolean {
+    const param = findUnsupportedRequestParam(error, this.sentDroppableParams(request));
+    if (!param || this.droppedParams.includes(param)) return false;
+    this.droppedParams.push(param);
+
+    let action: string;
+    switch (param) {
+      case "temperature":
+        this.sendTemperature = false;
+        action = "omitting temperature (the model uses its default)";
+        break;
+      case "max_tokens":
+        this.tokenLimitParam = "max_completion_tokens";
+        action = "sending max_completion_tokens instead of max_tokens";
+        break;
+      case "max_completion_tokens":
+        this.tokenLimitParam = undefined;
+        action = "omitting the output token cap";
+        break;
+      case "response_format":
+        this.sendResponseFormat = false;
+        action = "omitting response_format (the review parser falls back to markdown)";
+        break;
+    }
+
+    core.warning(
+      `Provider rejected the ${param} parameter (${errorMessage(error)}). Retrying once ${action} and keeping that shape for the rest of this run.`
+    );
+    return true;
   }
 
   private retryContext() {
@@ -170,57 +264,64 @@ export class LLMClient {
   }
 
   /**
-   * One completion request. If the provider rejects the reasoning parameter as
-   * unsupported or rejects its configured value, warn and retry once without it;
-   * the fallback then stays off so normal retry attempts are not multiplied.
+   * One completion request. If the provider rejects an optional part of the request —
+   * the reasoning control (unsupported or invalid value) or a parameter such as
+   * `temperature` / `max_tokens` that newer models refuse — warn, adjust the request
+   * shape once, and re-send. Every adjustment is one-shot and sticks for the rest of
+   * the run, so the loop is bounded and normal retry attempts are not multiplied.
    */
   private async performRequest(
     systemPrompt: string,
     userContent: string,
     jsonResponseMode: boolean
   ): Promise<ChatCompletionResult> {
-    try {
-      return await this.dispatch(this.buildRequest(systemPrompt, userContent, jsonResponseMode));
-    } catch (error) {
-      if (this.reasoningFallbackActive || !this.reasoningEffort) {
+    for (;;) {
+      const request = this.buildRequest(systemPrompt, userContent, jsonResponseMode);
+      try {
+        return await this.dispatch(request);
+      } catch (error) {
+        if (await this.applyReasoningFallback(error)) continue;
+        if (this.applyParameterFallback(error, request)) continue;
         throw error;
       }
-
-      const fallbackReason = isUnsupportedReasoningEffortError(error, this.reasoningEffort)
-        ? "unsupported"
-        : isInvalidReasoningEffortError(error, this.reasoningEffort)
-          ? "invalid-value"
-          : undefined;
-      if (!fallbackReason) throw error;
-
-      this.reasoningFallbackActive = true;
-      this.reasoningFallbackReason = fallbackReason;
-      core.warning(
-        `Provider rejected the configured reasoning effort as ${fallbackReason === "invalid-value" ? "invalid" : "unsupported"} (${errorMessage(error)}). ` +
-          "Retrying once without the reasoning parameter and continuing this run without reasoning controls."
-      );
-      await this.progress(
-        fallbackReason === "invalid-value"
-          ? "Provider rejected the configured reasoning effort — retrying without it…"
-          : "Provider rejected reasoning controls — retrying without them…"
-      );
-      return await this.dispatch(this.buildRequest(systemPrompt, userContent, jsonResponseMode));
     }
   }
 
-  private async dispatch(
-    request: OpenAI.Chat.Completions.ChatCompletionCreateParams & OpenRouterReasoningRequest
-  ): Promise<ChatCompletionResult> {
+  private async applyReasoningFallback(error: unknown): Promise<boolean> {
+    if (this.reasoningFallbackActive || !this.reasoningEffort || this.provider === "anthropic") {
+      return false;
+    }
+
+    const fallbackReason = isUnsupportedReasoningEffortError(error, this.reasoningEffort)
+      ? "unsupported"
+      : isInvalidReasoningEffortError(error, this.reasoningEffort)
+        ? "invalid-value"
+        : undefined;
+    if (!fallbackReason) return false;
+
+    this.reasoningFallbackActive = true;
+    this.reasoningFallbackReason = fallbackReason;
+    core.warning(
+      `Provider rejected the configured reasoning effort as ${fallbackReason === "invalid-value" ? "invalid" : "unsupported"} (${errorMessage(error)}). ` +
+        "Retrying once without the reasoning parameter and continuing this run without reasoning controls."
+    );
+    await this.progress(
+      fallbackReason === "invalid-value"
+        ? "Provider rejected the configured reasoning effort — retrying without it…"
+        : "Provider rejected reasoning controls — retrying without them…"
+    );
+    return true;
+  }
+
+  private async dispatch(request: ChatRequest): Promise<ChatCompletionResult> {
     return this.routerModel
       ? await this.streamChatCompletion(request)
       : await this.blockingChatCompletion(request);
   }
 
-  private async blockingChatCompletion(
-    request: OpenAI.Chat.Completions.ChatCompletionCreateParams
-  ): Promise<ChatCompletionResult> {
+  private async blockingChatCompletion(request: ChatRequest): Promise<ChatCompletionResult> {
     const response = await this.client.chat.completions.create({
-      ...request,
+      ...(request as OpenAI.Chat.Completions.ChatCompletionCreateParams),
       stream: false,
     });
     return {
@@ -230,9 +331,7 @@ export class LLMClient {
   }
 
   /** Stream so the first SSE chunk (model id) proves OpenRouter routed; abort if none arrives. */
-  private async streamChatCompletion(
-    request: OpenAI.Chat.Completions.ChatCompletionCreateParams & OpenRouterReasoningRequest
-  ): Promise<ChatCompletionResult> {
+  private async streamChatCompletion(request: ChatRequest): Promise<ChatCompletionResult> {
     const firstChunkMs = DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS;
     const controller = new AbortController();
     let gotFirstChunk = false;
@@ -250,7 +349,7 @@ export class LLMClient {
 
     try {
       const stream = await this.client.chat.completions.create(
-        { ...request, stream: true },
+        { ...(request as OpenAI.Chat.Completions.ChatCompletionCreateParams), stream: true },
         { signal: controller.signal }
       );
 
@@ -284,20 +383,24 @@ export class LLMClient {
     } catch (error) {
       clearStallTimer();
       if (!gotFirstChunk) {
-        // A 400/422 mentioning a reasoning request key is a definitive client response,
-        // not a stalled router. Surface it even when the stricter fallback classifiers
-        // reject it, so the provider's real validation error is not replaced by a stall.
-        // Other failures keep the stall retry path.
+        // A 400/422 mentioning a reasoning request key or rejecting a parameter we sent is a
+        // definitive client response, not a stalled router. Surface it even when the stricter
+        // fallback classifiers reject it, so the provider's real validation error is not
+        // replaced by a stall. Other failures keep the stall retry path.
         const status = Number((error as { status?: unknown })?.status);
         const mentionsReasoningObject = /\breasoning(?:[_-][\w.-]*)?\b/i.test(
           errorMessage(error)
         );
+        const sentEffort = request.reasoning?.effort ?? request.reasoning_effort;
         if (
-          request.reasoning !== undefined &&
-          (isUnsupportedReasoningEffortError(error, request.reasoning.effort) ||
-            isInvalidReasoningEffortError(error, request.reasoning.effort) ||
+          sentEffort !== undefined &&
+          (isUnsupportedReasoningEffortError(error, sentEffort) ||
+            isInvalidReasoningEffortError(error, sentEffort) ||
             ((status === 400 || status === 422) && mentionsReasoningObject))
         ) {
+          throw error;
+        }
+        if (findUnsupportedRequestParam(error, this.sentDroppableParams(request))) {
           throw error;
         }
         throw openRouterStallError(firstChunkMs);
@@ -310,34 +413,44 @@ export class LLMClient {
     systemPrompt: string,
     userContent: string,
     jsonResponseMode: boolean
-  ): OpenAI.Chat.Completions.ChatCompletionCreateParams & OpenRouterReasoningRequest {
-    const request: OpenAI.Chat.Completions.ChatCompletionCreateParams & OpenRouterReasoningRequest = {
+  ): ChatRequest {
+    const request: ChatRequest = {
       model: this.model,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userContent },
       ],
-      temperature: this.temperature,
     };
 
-    if (this.maxOutputTokens) {
-      request.max_tokens = this.maxOutputTokens;
+    if (this.sendTemperature) {
+      request.temperature = this.temperature;
     }
 
-    if (jsonResponseMode) {
+    if (this.maxOutputTokens && this.tokenLimitParam) {
+      request[this.tokenLimitParam] = this.maxOutputTokens;
+    }
+
+    if (jsonResponseMode && this.sendResponseFormat) {
       request.response_format = { type: "json_object" };
     }
 
     if (this.reasoningEffort && !this.reasoningFallbackActive) {
-      request.reasoning = {
-        effort: this.reasoningEffort,
-        exclude: true,
-      };
+      if (this.provider === "openai") {
+        // OpenAI-native control; the OpenRouter object is rejected as an unknown argument.
+        request.reasoning_effort = this.reasoningEffort;
+      } else if (this.provider !== "anthropic") {
+        // OpenRouter-style shape, also understood by many OpenAI-compatible gateways.
+        // Anthropic's compatibility layer ignores reasoning controls, so nothing is sent there.
+        request.reasoning = {
+          effort: this.reasoningEffort,
+          exclude: true,
+        };
+      }
     }
 
     if (this.routerModel) {
       // OpenRouter extension: try other providers when the first free route 404s.
-      (request as OpenAI.Chat.Completions.ChatCompletionCreateParams & {
+      (request as ChatRequest & {
         provider?: { allow_fallbacks: boolean };
       }).provider = { allow_fallbacks: true };
     }

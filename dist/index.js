@@ -673,10 +673,12 @@ exports.LLMClient = void 0;
 const openai_1 = __nccwpck_require__(2583);
 const config_1 = __nccwpck_require__(4008);
 const llm_retry_1 = __nccwpck_require__(4069);
+const llm_provider_1 = __nccwpck_require__(710);
 const core = __importStar(__nccwpck_require__(7484));
 class LLMClient {
     client;
     model;
+    provider;
     maxOutputTokens;
     maxAttempts;
     routerModel;
@@ -685,6 +687,11 @@ class LLMClient {
     reasoningEffort;
     reasoningFallbackActive = false;
     reasoningFallbackReason;
+    /** Request-shape compatibility state; adjusted once per rejected parameter and kept for the run. */
+    sendTemperature = true;
+    sendResponseFormat = true;
+    tokenLimitParam = "max_tokens";
+    droppedParams = [];
     constructor(baseUrl, apiKey, model, maxOutputTokens, timeoutMs = config_1.DEFAULT_LLM_TIMEOUT_MS, maxAttempts = config_1.DEFAULT_LLM_COMPLETION_ATTEMPTS, temperature = config_1.DEFAULT_LLM_TEMPERATURE, onProgress, reasoningEffort) {
         this.model = model;
         this.temperature = temperature;
@@ -697,10 +704,15 @@ class LLMClient {
                 : undefined;
         this.maxAttempts = (0, llm_retry_1.getLlmCompletionAttemptCount)(maxAttempts, model);
         const effectiveTimeoutMs = (0, llm_retry_1.resolveLlmTimeoutMs)(model, timeoutMs);
-        core.info(`Initializing LLM client: baseUrl=${baseUrl}, model=${model}, timeout=${effectiveTimeoutMs} ms, maxAttempts=${this.maxAttempts}, temperature=${this.temperature}`);
+        const normalizedBaseUrl = (0, llm_provider_1.normalizeLlmBaseUrl)(baseUrl);
+        this.provider = (0, llm_provider_1.detectLlmProvider)(normalizedBaseUrl);
+        if (normalizedBaseUrl !== baseUrl.trim()) {
+            core.info(`Normalized LLM base URL: ${baseUrl} -> ${normalizedBaseUrl}`);
+        }
+        core.info(`Initializing LLM client: baseUrl=${normalizedBaseUrl}, provider=${this.provider}, model=${model}, timeout=${effectiveTimeoutMs} ms, maxAttempts=${this.maxAttempts}, temperature=${this.temperature}`);
         // ponytail: chatCompletion owns retries; SDK maxRetries × 10-min timeout burned whole job budgets
         this.client = new openai_1.OpenAI({
-            baseURL: baseUrl,
+            baseURL: normalizedBaseUrl,
             apiKey: apiKey || "ollama",
             maxRetries: 0,
             timeout: effectiveTimeoutMs,
@@ -708,6 +720,63 @@ class LLMClient {
         if (this.routerModel) {
             core.info(`OpenRouter router model — ${config_1.DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS / 1000}s first-chunk stall detect, ${effectiveTimeoutMs / 1000}s stream cap, provider fallbacks.`);
         }
+        if ((0, llm_provider_1.isOpenAIReasoningModel)(model)) {
+            // o-series / GPT-5 / codex reject sampling controls and the legacy token cap outright.
+            this.sendTemperature = false;
+            this.tokenLimitParam = "max_completion_tokens";
+            core.info(`OpenAI reasoning model detected — omitting temperature and using max_completion_tokens.`);
+        }
+        if (this.provider === "anthropic") {
+            if (this.reasoningEffort) {
+                core.info("Anthropic's OpenAI-compatible endpoint ignores reasoning-effort controls; reasoning-effort is not sent. Claude decides its own thinking depth.");
+            }
+            core.info("Anthropic endpoint: response_format is ignored by the provider, so JSON mode relies on the prompt and the markdown fallback parser.");
+        }
+    }
+    /** Optional parameters the current request shape includes, in fallback-check order. */
+    sentDroppableParams(request) {
+        const sent = [];
+        if (request.temperature !== undefined)
+            sent.push("temperature");
+        if (request.max_tokens !== undefined)
+            sent.push("max_tokens");
+        if (request.max_completion_tokens !== undefined)
+            sent.push("max_completion_tokens");
+        if (request.response_format !== undefined)
+            sent.push("response_format");
+        return sent;
+    }
+    /**
+     * Adjust the request shape once for a parameter the provider rejected. Returns true when
+     * the request should be rebuilt and re-sent. Each parameter can trigger at most one
+     * adjustment per client so normal retries are not multiplied.
+     */
+    applyParameterFallback(error, request) {
+        const param = (0, llm_retry_1.findUnsupportedRequestParam)(error, this.sentDroppableParams(request));
+        if (!param || this.droppedParams.includes(param))
+            return false;
+        this.droppedParams.push(param);
+        let action;
+        switch (param) {
+            case "temperature":
+                this.sendTemperature = false;
+                action = "omitting temperature (the model uses its default)";
+                break;
+            case "max_tokens":
+                this.tokenLimitParam = "max_completion_tokens";
+                action = "sending max_completion_tokens instead of max_tokens";
+                break;
+            case "max_completion_tokens":
+                this.tokenLimitParam = undefined;
+                action = "omitting the output token cap";
+                break;
+            case "response_format":
+                this.sendResponseFormat = false;
+                action = "omitting response_format (the review parser falls back to markdown)";
+                break;
+        }
+        core.warning(`Provider rejected the ${param} parameter (${(0, llm_retry_1.errorMessage)(error)}). Retrying once ${action} and keeping that shape for the rest of this run.`);
+        return true;
     }
     retryContext() {
         return { model: this.model };
@@ -766,34 +835,46 @@ class LLMClient {
         throw new Error(`Empty response from LLM after ${this.maxAttempts} attempts (finish_reason=${lastFinishReason})`);
     }
     /**
-     * One completion request. If the provider rejects the reasoning parameter as
-     * unsupported or rejects its configured value, warn and retry once without it;
-     * the fallback then stays off so normal retry attempts are not multiplied.
+     * One completion request. If the provider rejects an optional part of the request —
+     * the reasoning control (unsupported or invalid value) or a parameter such as
+     * `temperature` / `max_tokens` that newer models refuse — warn, adjust the request
+     * shape once, and re-send. Every adjustment is one-shot and sticks for the rest of
+     * the run, so the loop is bounded and normal retry attempts are not multiplied.
      */
     async performRequest(systemPrompt, userContent, jsonResponseMode) {
-        try {
-            return await this.dispatch(this.buildRequest(systemPrompt, userContent, jsonResponseMode));
-        }
-        catch (error) {
-            if (this.reasoningFallbackActive || !this.reasoningEffort) {
+        for (;;) {
+            const request = this.buildRequest(systemPrompt, userContent, jsonResponseMode);
+            try {
+                return await this.dispatch(request);
+            }
+            catch (error) {
+                if (await this.applyReasoningFallback(error))
+                    continue;
+                if (this.applyParameterFallback(error, request))
+                    continue;
                 throw error;
             }
-            const fallbackReason = (0, llm_retry_1.isUnsupportedReasoningEffortError)(error, this.reasoningEffort)
-                ? "unsupported"
-                : (0, llm_retry_1.isInvalidReasoningEffortError)(error, this.reasoningEffort)
-                    ? "invalid-value"
-                    : undefined;
-            if (!fallbackReason)
-                throw error;
-            this.reasoningFallbackActive = true;
-            this.reasoningFallbackReason = fallbackReason;
-            core.warning(`Provider rejected the configured reasoning effort as ${fallbackReason === "invalid-value" ? "invalid" : "unsupported"} (${(0, llm_retry_1.errorMessage)(error)}). ` +
-                "Retrying once without the reasoning parameter and continuing this run without reasoning controls.");
-            await this.progress(fallbackReason === "invalid-value"
-                ? "Provider rejected the configured reasoning effort — retrying without it…"
-                : "Provider rejected reasoning controls — retrying without them…");
-            return await this.dispatch(this.buildRequest(systemPrompt, userContent, jsonResponseMode));
         }
+    }
+    async applyReasoningFallback(error) {
+        if (this.reasoningFallbackActive || !this.reasoningEffort || this.provider === "anthropic") {
+            return false;
+        }
+        const fallbackReason = (0, llm_retry_1.isUnsupportedReasoningEffortError)(error, this.reasoningEffort)
+            ? "unsupported"
+            : (0, llm_retry_1.isInvalidReasoningEffortError)(error, this.reasoningEffort)
+                ? "invalid-value"
+                : undefined;
+        if (!fallbackReason)
+            return false;
+        this.reasoningFallbackActive = true;
+        this.reasoningFallbackReason = fallbackReason;
+        core.warning(`Provider rejected the configured reasoning effort as ${fallbackReason === "invalid-value" ? "invalid" : "unsupported"} (${(0, llm_retry_1.errorMessage)(error)}). ` +
+            "Retrying once without the reasoning parameter and continuing this run without reasoning controls.");
+        await this.progress(fallbackReason === "invalid-value"
+            ? "Provider rejected the configured reasoning effort — retrying without it…"
+            : "Provider rejected reasoning controls — retrying without them…");
+        return true;
     }
     async dispatch(request) {
         return this.routerModel
@@ -856,16 +937,20 @@ class LLMClient {
         catch (error) {
             clearStallTimer();
             if (!gotFirstChunk) {
-                // A 400/422 mentioning a reasoning request key is a definitive client response,
-                // not a stalled router. Surface it even when the stricter fallback classifiers
-                // reject it, so the provider's real validation error is not replaced by a stall.
-                // Other failures keep the stall retry path.
+                // A 400/422 mentioning a reasoning request key or rejecting a parameter we sent is a
+                // definitive client response, not a stalled router. Surface it even when the stricter
+                // fallback classifiers reject it, so the provider's real validation error is not
+                // replaced by a stall. Other failures keep the stall retry path.
                 const status = Number(error?.status);
                 const mentionsReasoningObject = /\breasoning(?:[_-][\w.-]*)?\b/i.test((0, llm_retry_1.errorMessage)(error));
-                if (request.reasoning !== undefined &&
-                    ((0, llm_retry_1.isUnsupportedReasoningEffortError)(error, request.reasoning.effort) ||
-                        (0, llm_retry_1.isInvalidReasoningEffortError)(error, request.reasoning.effort) ||
+                const sentEffort = request.reasoning?.effort ?? request.reasoning_effort;
+                if (sentEffort !== undefined &&
+                    ((0, llm_retry_1.isUnsupportedReasoningEffortError)(error, sentEffort) ||
+                        (0, llm_retry_1.isInvalidReasoningEffortError)(error, sentEffort) ||
                         ((status === 400 || status === 422) && mentionsReasoningObject))) {
+                    throw error;
+                }
+                if ((0, llm_retry_1.findUnsupportedRequestParam)(error, this.sentDroppableParams(request))) {
                     throw error;
                 }
                 throw (0, llm_retry_1.openRouterStallError)(firstChunkMs);
@@ -880,19 +965,29 @@ class LLMClient {
                 { role: "system", content: systemPrompt },
                 { role: "user", content: userContent },
             ],
-            temperature: this.temperature,
         };
-        if (this.maxOutputTokens) {
-            request.max_tokens = this.maxOutputTokens;
+        if (this.sendTemperature) {
+            request.temperature = this.temperature;
         }
-        if (jsonResponseMode) {
+        if (this.maxOutputTokens && this.tokenLimitParam) {
+            request[this.tokenLimitParam] = this.maxOutputTokens;
+        }
+        if (jsonResponseMode && this.sendResponseFormat) {
             request.response_format = { type: "json_object" };
         }
         if (this.reasoningEffort && !this.reasoningFallbackActive) {
-            request.reasoning = {
-                effort: this.reasoningEffort,
-                exclude: true,
-            };
+            if (this.provider === "openai") {
+                // OpenAI-native control; the OpenRouter object is rejected as an unknown argument.
+                request.reasoning_effort = this.reasoningEffort;
+            }
+            else if (this.provider !== "anthropic") {
+                // OpenRouter-style shape, also understood by many OpenAI-compatible gateways.
+                // Anthropic's compatibility layer ignores reasoning controls, so nothing is sent there.
+                request.reasoning = {
+                    effort: this.reasoningEffort,
+                    exclude: true,
+                };
+            }
         }
         if (this.routerModel) {
             // OpenRouter extension: try other providers when the first free route 404s.
@@ -927,6 +1022,86 @@ exports.LLMClient = LLMClient;
 
 /***/ }),
 
+/***/ 710:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.detectLlmProvider = detectLlmProvider;
+exports.normalizeLlmBaseUrl = normalizeLlmBaseUrl;
+exports.isOpenAIReasoningModel = isOpenAIReasoningModel;
+const OPENAI_CHAT_SUFFIX = /\/chat\/completions\/?$/i;
+const ANTHROPIC_MESSAGES_SUFFIX = /\/messages\/?$/i;
+function parseUrl(baseUrl) {
+    try {
+        return new URL(baseUrl);
+    }
+    catch {
+        return undefined;
+    }
+}
+function hostMatches(host, domain) {
+    return host === domain || host.endsWith(`.${domain}`);
+}
+function detectLlmProvider(baseUrl) {
+    const url = parseUrl(baseUrl.trim());
+    if (!url)
+        return "other";
+    const host = url.hostname.toLowerCase();
+    if (hostMatches(host, "anthropic.com"))
+        return "anthropic";
+    if (hostMatches(host, "openai.com"))
+        return "openai";
+    if (hostMatches(host, "openrouter.ai"))
+        return "openrouter";
+    return "other";
+}
+/**
+ * Accept the URLs people actually paste — with or without `/v1`, with a trailing
+ * slash, or the full endpoint path — and return the SDK base URL.
+ *
+ * Only the well-known hosted providers get `/v1` appended; self-hosted and proxy
+ * URLs are passed through untouched apart from endpoint-suffix stripping, because
+ * their paths are arbitrary (`/openai/v1`, `/api/v1`, …).
+ */
+function normalizeLlmBaseUrl(baseUrl) {
+    const trimmed = baseUrl.trim();
+    const url = parseUrl(trimmed);
+    if (!url)
+        return trimmed;
+    let path = url.pathname.replace(OPENAI_CHAT_SUFFIX, "");
+    const provider = detectLlmProvider(trimmed);
+    if (provider === "anthropic") {
+        path = path.replace(ANTHROPIC_MESSAGES_SUFFIX, "");
+    }
+    path = path.replace(/\/+$/, "");
+    if ((provider === "anthropic" || provider === "openai") && !/\/v\d+$/i.test(path)) {
+        path = `${path}/v1`;
+    }
+    url.pathname = path || "/";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+}
+/**
+ * OpenAI reasoning families (o-series, GPT-5, codex) reject sampling controls such as
+ * `temperature` and only accept `max_completion_tokens`. Detect them up front so the
+ * first request already has the right shape; unknown models still recover through the
+ * reactive parameter fallback.
+ */
+function isOpenAIReasoningModel(model) {
+    if (!model)
+        return false;
+    const normalized = model.trim().toLowerCase().replace(/^openai\//, "");
+    return (/^o[1-9](?:[-.]|$)/.test(normalized) ||
+        /^gpt-5(?:[-.]|$)/.test(normalized) ||
+        /^codex(?:[-.]|$)/.test(normalized));
+}
+//# sourceMappingURL=llm-provider.js.map
+
+/***/ }),
+
 /***/ 4069:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -939,6 +1114,7 @@ exports.isOpenRouterProviderError = isOpenRouterProviderError;
 exports.errorMessage = errorMessage;
 exports.isUnsupportedReasoningEffortError = isUnsupportedReasoningEffortError;
 exports.isInvalidReasoningEffortError = isInvalidReasoningEffortError;
+exports.findUnsupportedRequestParam = findUnsupportedRequestParam;
 exports.isRetriableLlmError = isRetriableLlmError;
 exports.shouldUseJsonResponseMode = shouldUseJsonResponseMode;
 exports.computeRetryDelayMs = computeRetryDelayMs;
@@ -1087,6 +1263,35 @@ function structuredReasoningParam(error) {
         return false;
     const param = error.param;
     return typeof param === "string" && /\b(?:reasoning|effort|exclude)/i.test(param);
+}
+/** Rejection cues seen from OpenAI-compatible servers when a request key is not accepted. */
+const PARAM_REJECTION_CUES = /\b(?:unsupported|not\s+supported|does\s+not\s+support|do\s+not\s+support|not\s+allowed|not\s+permitted|unknown|unrecognized|unrecognised|unexpected|invalid|extra\s+(?:inputs?|fields?)|only\s+(?:the\s+)?default|only\s+\S+\s+is\s+allowed|must\s+be|should\s+be|instead)\b/i;
+/**
+ * Returns the first sent optional parameter that a 400/422 response rejects, or
+ * undefined. Structured `param` (OpenAI SDK errors) wins; otherwise the message must
+ * name the parameter (quoted or bare) alongside a rejection cue. Examples this matches:
+ *   "Unsupported value: 'temperature' does not support 0.1 with this model."
+ *   "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."
+ *   "temperature must be 1 for reasoning models"
+ * Dropping any of these is safe — the model falls back to its own defaults — so the
+ * cue list is intentionally broad.
+ */
+function findUnsupportedRequestParam(error, sentParams) {
+    if (!error || typeof error !== "object" || sentParams.length === 0)
+        return undefined;
+    const status = Number(error.status);
+    if (status !== 400 && status !== 422)
+        return undefined;
+    const structuredParam = error.param;
+    if (typeof structuredParam === "string") {
+        const match = sentParams.find((param) => structuredParam.toLowerCase() === param);
+        if (match)
+            return match;
+    }
+    const message = errorMessage(error);
+    if (!PARAM_REJECTION_CUES.test(message))
+        return undefined;
+    return sentParams.find((param) => new RegExp(`(?:^|[^\\w])${param}(?:$|[^\\w])`, "i").test(message));
 }
 function isRetriableLlmError(error, context = {}) {
     if (!error)

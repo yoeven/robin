@@ -1,5 +1,6 @@
 import {
   computeRetryDelayMs,
+  findUnsupportedRequestParam,
   getLlmCompletionAttemptCount,
   isInvalidReasoningEffortError,
   isOpenRouterRouterModel,
@@ -436,6 +437,123 @@ describe("isInvalidReasoningEffortError", () => {
         "high"
       )
     ).toBe(false);
+  });
+});
+
+describe("findUnsupportedRequestParam", () => {
+  const sent = ["temperature", "max_tokens", "response_format"] as const;
+
+  it("uses the structured param when the SDK provides one", () => {
+    expect(
+      findUnsupportedRequestParam(
+        { status: 400, param: "temperature", message: "Unsupported value" },
+        sent
+      )
+    ).toBe("temperature");
+    expect(
+      findUnsupportedRequestParam(
+        {
+          status: 400,
+          param: "max_tokens",
+          message:
+            "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.",
+        },
+        sent
+      )
+    ).toBe("max_tokens");
+  });
+
+  it("matches the live OpenAI messages without a structured param", () => {
+    expect(
+      findUnsupportedRequestParam(
+        {
+          status: 400,
+          message:
+            "400 Unsupported value: 'temperature' does not support 0.1 with this model. Only the default (1) value is supported.",
+        },
+        sent
+      )
+    ).toBe("temperature");
+    expect(
+      findUnsupportedRequestParam(
+        {
+          status: 400,
+          message:
+            "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.",
+        },
+        sent
+      )
+    ).toBe("max_tokens");
+  });
+
+  it("matches provider phrasing that names the parameter bare", () => {
+    expect(
+      findUnsupportedRequestParam(
+        { status: 400, message: "temperature must be 1 for reasoning models" },
+        sent
+      )
+    ).toBe("temperature");
+    expect(
+      findUnsupportedRequestParam(
+        { status: 400, message: "Invalid temperature: only 1 is allowed" },
+        sent
+      )
+    ).toBe("temperature");
+    expect(
+      findUnsupportedRequestParam(
+        { status: 422, message: "response_format: Extra inputs are not permitted" },
+        sent
+      )
+    ).toBe("response_format");
+  });
+
+  it("only reports parameters that were actually sent", () => {
+    expect(
+      findUnsupportedRequestParam(
+        { status: 400, message: "Unsupported parameter: 'max_tokens'" },
+        ["temperature"]
+      )
+    ).toBeUndefined();
+    expect(
+      findUnsupportedRequestParam(
+        { status: 400, param: "max_completion_tokens", message: "Unknown parameter" },
+        ["max_tokens"]
+      )
+    ).toBeUndefined();
+    expect(findUnsupportedRequestParam({ status: 400, message: "Unsupported parameter: 'temperature'" }, [])).toBeUndefined();
+  });
+
+  it("does not match max_tokens inside max_completion_tokens", () => {
+    expect(
+      findUnsupportedRequestParam(
+        { status: 400, message: "Unknown parameter: max_completion_tokens" },
+        ["max_tokens"]
+      )
+    ).toBeUndefined();
+  });
+
+  it("ignores non-validation statuses and unrelated validation errors", () => {
+    expect(
+      findUnsupportedRequestParam({ status: 500, message: "temperature service failed" }, sent)
+    ).toBeUndefined();
+    expect(
+      findUnsupportedRequestParam({ status: 401, message: "Invalid API key" }, sent)
+    ).toBeUndefined();
+    expect(
+      findUnsupportedRequestParam({ status: 400, message: "Invalid API key" }, sent)
+    ).toBeUndefined();
+    expect(
+      findUnsupportedRequestParam(
+        {
+          status: 400,
+          message:
+            "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.",
+        },
+        sent
+      )
+    ).toBeUndefined();
+    expect(findUnsupportedRequestParam(new Error("temperature unsupported"), sent)).toBeUndefined();
+    expect(findUnsupportedRequestParam(undefined, sent)).toBeUndefined();
   });
 });
 

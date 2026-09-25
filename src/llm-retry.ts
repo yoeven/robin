@@ -162,6 +162,46 @@ function structuredReasoningParam(error: unknown): boolean {
   return typeof param === "string" && /\b(?:reasoning|effort|exclude)/i.test(param);
 }
 
+/** Optional request parameters Robin can drop or rename without changing what is reviewed. */
+export type DroppableRequestParam =
+  | "temperature"
+  | "max_tokens"
+  | "max_completion_tokens"
+  | "response_format";
+
+/** Rejection cues seen from OpenAI-compatible servers when a request key is not accepted. */
+const PARAM_REJECTION_CUES =
+  /\b(?:unsupported|not\s+supported|does\s+not\s+support|do\s+not\s+support|not\s+allowed|not\s+permitted|unknown|unrecognized|unrecognised|unexpected|invalid|extra\s+(?:inputs?|fields?)|only\s+(?:the\s+)?default|only\s+\S+\s+is\s+allowed|must\s+be|should\s+be|instead)\b/i;
+
+/**
+ * Returns the first sent optional parameter that a 400/422 response rejects, or
+ * undefined. Structured `param` (OpenAI SDK errors) wins; otherwise the message must
+ * name the parameter (quoted or bare) alongside a rejection cue. Examples this matches:
+ *   "Unsupported value: 'temperature' does not support 0.1 with this model."
+ *   "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."
+ *   "temperature must be 1 for reasoning models"
+ * Dropping any of these is safe — the model falls back to its own defaults — so the
+ * cue list is intentionally broad.
+ */
+export function findUnsupportedRequestParam(
+  error: unknown,
+  sentParams: readonly DroppableRequestParam[]
+): DroppableRequestParam | undefined {
+  if (!error || typeof error !== "object" || sentParams.length === 0) return undefined;
+  const status = Number((error as { status?: unknown }).status);
+  if (status !== 400 && status !== 422) return undefined;
+
+  const structuredParam = (error as { param?: unknown }).param;
+  if (typeof structuredParam === "string") {
+    const match = sentParams.find((param) => structuredParam.toLowerCase() === param);
+    if (match) return match;
+  }
+
+  const message = errorMessage(error);
+  if (!PARAM_REJECTION_CUES.test(message)) return undefined;
+  return sentParams.find((param) => new RegExp(`(?:^|[^\\w])${param}(?:$|[^\\w])`, "i").test(message));
+}
+
 export function isRetriableLlmError(error: unknown, context: LlmRetryContext = {}): boolean {
   if (!error) return false;
 

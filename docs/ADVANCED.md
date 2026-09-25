@@ -234,11 +234,43 @@ jobs:
 
 If you raise `llm-timeout-ms` above 10 minutes, also raise the job `timeout-minutes`.
 
+### Provider notes
+
+Every provider is reached through the OpenAI chat-completions wire format. Robin
+normalizes the base URL (trailing slash, a pasted `/chat/completions` or `/messages`
+suffix, a missing `/v1` on the OpenAI and Anthropic hosts) and adjusts the request shape
+for the hosts below. Self-hosted and proxy URLs are passed through unchanged.
+
+| Provider | `LLM_BASE_URL` | Notes |
+| --- | --- | --- |
+| OpenAI | `https://api.openai.com/v1` | `reasoning-effort` is sent as OpenAI-native `reasoning_effort`. Reasoning models (`o1`, `o3`, `o4-mini`, `gpt-5*`, `codex-*`) are sent without `temperature` and with `max_completion_tokens` instead of `max_tokens`, because they reject both |
+| Anthropic (Claude) | `https://api.anthropic.com/v1` | Uses Anthropic's [OpenAI SDK compatibility](https://docs.anthropic.com/en/api/openai-sdk) endpoint with your regular Anthropic API key (`LLM_API_KEY`). `https://api.anthropic.com` without `/v1` is accepted. Anthropic ignores `response_format`, so JSON mode relies on the prompt plus the markdown fallback parser, and it ignores reasoning controls — Robin sends none there and Claude picks its own thinking depth. `temperature` above `1` is capped by Anthropic |
+| OpenRouter | `https://openrouter.ai/api/v1` | `reasoning-effort` uses the OpenRouter `reasoning: { effort, exclude }` object; router models get stall detection and provider fallbacks |
+| Anything else (Groq, Ollama, vLLM, gateways) | provider URL | Default request shape; unsupported parameters are recovered as described below |
+
+### Models that reject request parameters
+
+Newer models refuse parameters older ones accepted — OpenAI reasoning models return
+`Unsupported value: 'temperature' does not support 0.1 with this model` and
+`Unsupported parameter: 'max_tokens' … Use 'max_completion_tokens' instead`. When a
+400/422 response names one of the optional parameters Robin sent (`temperature`,
+`max_tokens`, `max_completion_tokens`, `response_format`), Robin logs a warning, adjusts
+that one parameter (omits `temperature`, switches `max_tokens` to
+`max_completion_tokens`, drops the token cap or `response_format`), re-sends once, and
+keeps the adjusted shape for the rest of the run. Each parameter is adjusted at most once
+per run, so a provider that keeps rejecting surfaces its real error instead of looping.
+Known OpenAI reasoning families skip the round trip and start with the right shape.
+
+Dropping these is safe: the model falls back to its own default sampling, and the review
+parser already handles non-JSON output. Auth, rate-limit, server, and unrelated
+validation errors do not trigger this path.
+
 ### Models that require a fixed temperature
 
 Robin samples at `0.1` so reviews stay near-deterministic. Some providers reject that and
-accept only one value — Kimi models require `1`, and the request fails without it. Set
-`llm-temperature` to whatever the provider demands:
+accept only one value — Kimi models require `1`. Robin recovers automatically by
+retrying without `temperature` (see above); set `llm-temperature` only when you want a
+specific value sent rather than the model default:
 
 ```yaml
 jobs:
@@ -288,11 +320,15 @@ jobs:
 
 Common values are `low`, `medium`, and `high`; exact names are provider-dependent (some
 providers also use `minimal`, `xhigh`, or `max`). Robin forwards the trimmed value
-unchanged. When set, the request includes `reasoning: { effort: "<value>", exclude: true }`
-— hidden reasoning is excluded from the response and never parsed; only the review text is
-used. This is the OpenRouter-style request shape; providers that expect a different native
-parameter (for example OpenAI-native `reasoning_effort`) reject it, and the fallback below
-then runs the review without reasoning controls.
+unchanged. The request shape depends on the host in `LLM_BASE_URL`:
+
+- `api.openai.com`: OpenAI-native `reasoning_effort: "<value>"`.
+- `api.anthropic.com`: nothing is sent — Anthropic's compatibility endpoint ignores
+  reasoning controls and Claude decides its own thinking depth. Robin logs this once.
+- Everything else: OpenRouter-style `reasoning: { effort: "<value>", exclude: true }` —
+  hidden reasoning is excluded from the response and never parsed; only the review text is
+  used. Providers that expect a different native parameter reject it, and the fallback
+  below then runs the review without reasoning controls.
 
 If a provider rejects the parameter itself as unknown or unsupported, or clearly rejects
 the configured effort value (a 400/422 response such as `Unsupported parameter: reasoning`
@@ -381,7 +417,8 @@ No daily quota from this action. Real limits:
 | Job cancelled / 15 min with no review | Hung LLM or concurrency cancel while waiting | Status comment should say interrupted — comment `/robin` again; pin `@v2.0.4`+ for stall detect |
 | `404 Provider returned error` | OpenRouter free route missed one provider | Keep `LLM_MODEL=openrouter/free` — action retries (5×) with provider fallbacks; no secret updates when models rotate |
 | `Request timed out` | Large PR or slow free model | Lower `max-diff-size` or raise `llm-timeout-ms` (router models default to 2 min per attempt) |
-| `temperature` rejected / must be 1 | Model accepts only one temperature | Set `llm-temperature` to the value the provider requires (Kimi: `1`) |
+| `temperature` / `max_tokens` / `response_format` rejected | Newer model refuses an optional parameter (OpenAI reasoning models, Kimi) | Action warns, retries once without it (`max_tokens` → `max_completion_tokens`), and keeps that shape for the run; set `llm-temperature` only to pin a specific value (Kimi: `1`) |
+| `404` on `https://api.anthropic.com` | Base URL missing `/v1` on an older Robin | Use `https://api.anthropic.com/v1`; `@v2`/`@main` normalize it automatically |
 | `reasoning-effort` rejected as unsupported or invalid | Provider/model does not accept the reasoning control or configured value | The action warns and retries once with no reasoning override. If that succeeds, the review completes and its final status comment tells you to update `.github/robin.yml` or the workflow `with:` block |
 | `Resource not accessible by integration` | Missing permissions | Add `pull-requests: write` |
 | Slash command ignored | Wrong format or permission | `/robin` or `/review` as first line; need write access |

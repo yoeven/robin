@@ -11,7 +11,7 @@ max-diff-size: 25000
 max-comments: 10
 json-response-mode: true
 request-changes: true
-# reasoning-effort: high   # provider-dependent; omit to send no reasoning configuration
+# reasoning-effort: high   # default; provider-dependent. Set "off" to send no reasoning configuration
 skip-paths:
   - "**/generated/**"
 ```
@@ -22,7 +22,7 @@ skip-paths:
 | `max-comments` | Used when the workflow still passes the action default (`15`) |
 | `json-response-mode` | Used when `use-json-response-mode` is empty (action default defers to this file) |
 | `request-changes` | Used when `request-changes` input is empty. `true` (default) blocks on high findings; `false` posts advisor-only comments |
-| `reasoning-effort` | Used when the `reasoning-effort` action/workflow input is empty. Provider-dependent reasoning value; omit for no reasoning configuration |
+| `reasoning-effort` | Used when the `reasoning-effort` action/workflow input is empty. Provider-dependent reasoning value; defaults to `high` when unset, `off` sends no reasoning configuration |
 | `skip-paths` | Extra paths removed from the diff before the LLM call |
 
 Lockfiles (npm, yarn, pnpm, Cargo, Gemfile, poetry), `dist/`, `node_modules/`, and minified assets are always skipped automatically. If every changed file is skipped, the action posts a status comment and skips the LLM call.
@@ -115,7 +115,7 @@ Available on the [direct action](../action.yml) and the [reusable workflow](../.
 | `request-changes` | omit → `true` (defer to repo config) | `true` submits a blocking REQUEST_CHANGES review on high findings; `false` posts a non-blocking COMMENT (advisor mode). Reusable workflow input is a boolean with no default — omit it to let `.github/robin.yml` win |
 | `max-diff-size` | `50000` | Max diff characters sent to the model |
 | `max-output-tokens` | empty | Cap response tokens (optional) |
-| `reasoning-effort` | empty (defer to repo config) | Optional provider reasoning effort, provider-dependent (for example `low`, `medium`, `high`). Empty defers to `.github/robin.yml`; if that is also unset, no `reasoning` property is sent |
+| `reasoning-effort` | empty (defer to repo config, then `high`) | Provider reasoning effort, provider-dependent (for example `low`, `medium`, `high`). Empty defers to `.github/robin.yml`; if that is also unset, `high` is sent. `off` sends no reasoning configuration |
 | `llm-timeout-ms` | `600000` | LLM timeout (10 minutes) |
 | `llm-temperature` | `0.1` | Sampling temperature (0–2). Raise only if your model rejects the default — some models accept a single fixed value (Kimi requires `1`) |
 | `max-comments` | `15` | Max inline comments |
@@ -291,16 +291,18 @@ overrides in your workflow.
 
 ### Reasoning effort (provider-dependent)
 
-Some providers and models accept a reasoning-effort control. Robin disables it by default:
-when `reasoning-effort` is unset or whitespace, the API request is unchanged and contains no
-`reasoning` property.
+Some providers and models accept a reasoning-effort control. Robin asks for `high` by
+default: when `reasoning-effort` is unset or whitespace everywhere, the request carries
+`high` in the provider's shape (below). Providers that do not understand the control reject
+it and Robin falls back quietly (see the end of this section). To send no reasoning
+configuration at all, set the value to `off`.
 
 Set it per repository in `.github/robin.yml` — the normal location, because reasoning is
 configuration, not a credential:
 
 ```yaml
 # .github/robin.yml
-reasoning-effort: high
+reasoning-effort: high   # or low / medium / a provider-specific name, or off
 ```
 
 The workflow input overrides the repo config when non-empty, so consumers can scope an
@@ -335,8 +337,10 @@ the configured effort value (a 400/422 response such as `Unsupported parameter: 
 or `reasoning effort must be one of low, medium, high`), Robin logs a warning and retries
 that completion once without the `reasoning` property. It then keeps running without a
 reasoning override for the rest of the run. When the retry succeeds, the review completes
-normally and the final status comment keeps a visible warning telling the user to update
-`reasoning-effort` in `.github/robin.yml` or the workflow `with:` block.
+normally. If you set the value yourself (input or `.github/robin.yml`), the final status
+comment also keeps a visible warning telling you to update `reasoning-effort`; when only
+the `high` default was rejected, nothing is added to the PR — the fallback is recorded in
+the Actions log only.
 
 Auth, rate-limit, server, timeout, and unrelated validation errors do not trigger this
 fallback. The retry omits the optional reasoning override; it does not guess a different
@@ -419,7 +423,7 @@ No daily quota from this action. Real limits:
 | `Request timed out` | Large PR or slow free model | Lower `max-diff-size` or raise `llm-timeout-ms` (router models default to 2 min per attempt) |
 | `temperature` / `max_tokens` / `response_format` rejected | Newer model refuses an optional parameter (OpenAI reasoning models, Kimi) | Action warns, retries once without it (`max_tokens` → `max_completion_tokens`), and keeps that shape for the run; set `llm-temperature` only to pin a specific value (Kimi: `1`) |
 | `404` on `https://api.anthropic.com` | Base URL missing `/v1` on an older Robin | Use `https://api.anthropic.com/v1`; `@v2`/`@main` normalize it automatically |
-| `reasoning-effort` rejected as unsupported or invalid | Provider/model does not accept the reasoning control or configured value | The action warns and retries once with no reasoning override. If that succeeds, the review completes and its final status comment tells you to update `.github/robin.yml` or the workflow `with:` block |
+| `reasoning-effort` rejected as unsupported or invalid | Provider/model does not accept the reasoning control or configured value | The action warns and retries once with no reasoning override. If that succeeds, the review completes; a user-set value also gets a status-comment notice to update `.github/robin.yml` or the workflow `with:` block. Set `reasoning-effort: off` to stop sending it |
 | `Resource not accessible by integration` | Missing permissions | Add `pull-requests: write` |
 | Slash command ignored | Wrong format or permission | `/robin` or `/review` as first line; need write access |
 | `/robin` does nothing on `@v1` | Stale `v1` tag before v1.4.0 | Use `/review`, pin `@v1.4.0`+, or `@v2`; floating `v1` tracks latest `1.x` on release |

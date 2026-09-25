@@ -37,7 +37,7 @@ inputs:
     required: false
     default: ""
   reasoning-effort:
-    description: "Optional reasoning effort using the OpenRouter-style reasoning object, for providers/models that accept it (for example low, medium, high, xhigh, or max). Leave empty to omit reasoning configuration entirely or to defer to .github/robin.yml; unsupported or invalid values retry once with no reasoning override and leave a status warning."
+    description: "Reasoning effort for providers/models that accept it (for example low, medium, high, xhigh, or max). Leave empty to defer to .github/robin.yml, which defaults to high; set to off to send no reasoning configuration. Unsupported or invalid values retry once with no reasoning override; a user-configured value that is rejected also leaves a status warning."
     required: false
     default: ""
   llm-timeout-ms:

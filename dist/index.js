@@ -1532,8 +1532,12 @@ async function run() {
         const jsonResponseMode = (0, repo_config_1.resolveJsonResponseMode)(jsonResponseModeInput, repoConfig);
         const requestChanges = (0, repo_config_1.resolveRequestChanges)(requestChangesInput, repoConfig);
         const reasoningEffort = (0, repo_config_1.resolveReasoningEffort)(reasoningEffortInput, repoConfig);
+        const reasoningEffortConfigured = (0, repo_config_1.isReasoningEffortConfigured)(reasoningEffortInput, repoConfig);
         if (reasoningEffort) {
-            core.info(`Reasoning effort: ${reasoningEffort}`);
+            core.info(`Reasoning effort: ${reasoningEffort}${reasoningEffortConfigured ? "" : " (default; set reasoning-effort: off to send none)"}`);
+        }
+        else {
+            core.info("Reasoning effort: off (no reasoning configuration sent)");
         }
         const diff = await gitUtils.getPullRequestDiff(owner, repo, prNumber);
         if (!diff || diff.trim().length === 0) {
@@ -1568,6 +1572,9 @@ async function run() {
             await updateStatusComment(octokit, owner, repo, statusCommentId, buildProgressStatusBody(detail, statusCommand, statusModel));
         }, reasoningEffort);
         const useJsonMode = command === "review" && jsonResponseMode;
+        // Only a user-configured effort earns a PR-visible "fix your config" notice; a rejected
+        // default falls back quietly in the logs.
+        const reasoningNoticeReason = () => reasoningEffortConfigured ? llm.getReasoningFallbackReason() : undefined;
         let reviewText;
         if (command === "summary") {
             reviewText = (await runSummary(llm, truncatedDiff)).content;
@@ -1583,7 +1590,7 @@ async function run() {
                 issue_number: prNumber,
                 body: ["## " + github_reviewer_1.ROBIN_SIGNATURE + " · Summary", "", reviewText].join("\n"),
             });
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("summary", undefined, llm.getReasoningFallbackReason()));
+            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("summary", undefined, reasoningNoticeReason()));
         }
         else {
             // Full review parsed and posted as a review
@@ -1600,7 +1607,7 @@ async function run() {
             core.info(`Found ${findings.high.length} high, ${findings.medium.length} medium, ${findings.low.length} low, ${findings.suggestions.length} suggestions`);
             const reviewer = new github_reviewer_1.GitHubReviewer(octokit, maxComments);
             await reviewer.postReview(owner, repo, prNumber, findings, requestChanges);
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("review", findings, llm.getReasoningFallbackReason()));
+            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("review", findings, reasoningNoticeReason()));
             if (findings.high.length > 0 && failOnHigh) {
                 core.setFailed(`Found ${findings.high.length} high severity issue(s). Failing check.`);
             }
@@ -2090,13 +2097,14 @@ function buildReasoningFallbackNotice(reason) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.DEFAULT_MAX_COMMENTS = exports.DEFAULT_ACTION_MAX_DIFF_SIZE = exports.DEFAULT_CONFIG_FILE = void 0;
+exports.REASONING_EFFORT_OFF = exports.DEFAULT_REASONING_EFFORT = exports.DEFAULT_MAX_COMMENTS = exports.DEFAULT_ACTION_MAX_DIFF_SIZE = exports.DEFAULT_CONFIG_FILE = void 0;
 exports.parseRepoConfigYaml = parseRepoConfigYaml;
 exports.resolveMaxDiffSize = resolveMaxDiffSize;
 exports.resolveMaxComments = resolveMaxComments;
 exports.resolveJsonResponseMode = resolveJsonResponseMode;
 exports.resolveRequestChanges = resolveRequestChanges;
 exports.resolveReasoningEffort = resolveReasoningEffort;
+exports.isReasoningEffortConfigured = isReasoningEffortConfigured;
 exports.DEFAULT_CONFIG_FILE = ".github/robin.yml";
 exports.DEFAULT_ACTION_MAX_DIFF_SIZE = 50000;
 /** Single default shared by action.yml and the reusable review.yml workflow. */
@@ -2215,12 +2223,29 @@ function resolveRequestChanges(actionInput, repoConfig) {
         return false;
     return repoConfig?.requestChanges ?? true;
 }
-/** Reasoning effort is provider configuration: explicit input first, then `.github/robin.yml`, else unset. */
+/** Sent when neither the action input nor `.github/robin.yml` sets `reasoning-effort`. */
+exports.DEFAULT_REASONING_EFFORT = "high";
+/** Sentinel value that sends no reasoning configuration at all. */
+exports.REASONING_EFFORT_OFF = "off";
+/**
+ * Reasoning effort is provider configuration: explicit input first, then `.github/robin.yml`,
+ * else the default. `off` (any case) disables reasoning configuration entirely.
+ */
 function resolveReasoningEffort(actionInput, repoConfig) {
+    const configured = configuredReasoningEffort(actionInput, repoConfig);
+    const value = configured ?? exports.DEFAULT_REASONING_EFFORT;
+    return value.toLowerCase() === exports.REASONING_EFFORT_OFF ? undefined : value;
+}
+/** True when the user set `reasoning-effort` themselves (input or repo config), not the default. */
+function isReasoningEffortConfigured(actionInput, repoConfig) {
+    return configuredReasoningEffort(actionInput, repoConfig) !== undefined;
+}
+function configuredReasoningEffort(actionInput, repoConfig) {
     const trimmed = actionInput.trim();
     if (trimmed)
         return trimmed;
-    return repoConfig?.reasoningEffort;
+    const fromRepo = repoConfig?.reasoningEffort?.trim();
+    return fromRepo || undefined;
 }
 //# sourceMappingURL=repo-config.js.map
 

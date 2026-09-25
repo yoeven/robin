@@ -140,12 +140,32 @@ export function resolveRequestChanges(actionInput: string, repoConfig?: RepoConf
   return repoConfig?.requestChanges ?? true;
 }
 
-/** Reasoning effort is provider configuration: explicit input first, then `.github/robin.yml`, else unset. */
+/** Sent when neither the action input nor `.github/robin.yml` sets `reasoning-effort`. */
+export const DEFAULT_REASONING_EFFORT = "high";
+/** Sentinel value that sends no reasoning configuration at all. */
+export const REASONING_EFFORT_OFF = "off";
+
+/**
+ * Reasoning effort is provider configuration: explicit input first, then `.github/robin.yml`,
+ * else the default. `off` (any case) disables reasoning configuration entirely.
+ */
 export function resolveReasoningEffort(
   actionInput: string,
   repoConfig?: RepoConfig
 ): string | undefined {
+  const configured = configuredReasoningEffort(actionInput, repoConfig);
+  const value = configured ?? DEFAULT_REASONING_EFFORT;
+  return value.toLowerCase() === REASONING_EFFORT_OFF ? undefined : value;
+}
+
+/** True when the user set `reasoning-effort` themselves (input or repo config), not the default. */
+export function isReasoningEffortConfigured(actionInput: string, repoConfig?: RepoConfig): boolean {
+  return configuredReasoningEffort(actionInput, repoConfig) !== undefined;
+}
+
+function configuredReasoningEffort(actionInput: string, repoConfig?: RepoConfig): string | undefined {
   const trimmed = actionInput.trim();
   if (trimmed) return trimmed;
-  return repoConfig?.reasoningEffort;
+  const fromRepo = repoConfig?.reasoningEffort?.trim();
+  return fromRepo || undefined;
 }

@@ -272,7 +272,7 @@ GitHub’s servers cannot reach `localhost` on your laptop. For Ollama at home, 
 
 ## Optional: config and custom rules
 
-Copy [`.github/robin.yml.example`](.github/robin.yml.example) to `.github/robin.yml` to set `max-diff-size`, skip extra paths, and more. The same file is the normal place to set `reasoning-effort` for providers that expose reasoning controls; leave it unset to send no reasoning configuration. Details: [docs/ADVANCED.md](docs/ADVANCED.md#repository-config-file) and [Reasoning effort](docs/ADVANCED.md#reasoning-effort-provider-dependent).
+Copy [`.github/robin.yml.example`](.github/robin.yml.example) to `.github/robin.yml` to set `max-diff-size`, skip extra paths, and more. The same file is the normal place to change `reasoning-effort` for providers that expose reasoning controls; it defaults to `high`, and `off` sends no reasoning configuration. Details: [docs/ADVANCED.md](docs/ADVANCED.md#repository-config-file) and [Reasoning effort](docs/ADVANCED.md#reasoning-effort-provider-dependent).
 
 Add `.github/code-reviewer.md` in your repo:
 
@@ -296,7 +296,7 @@ Add `.github/code-reviewer.md` in your repo:
 | `OpenRouter stall` / job runs 15 min with no review | Auto-router hung — action now aborts after 45s with no stream and retries | Watch Actions log for `LLM resolved model` (routing OK); pin `@v2` or `@main` for the fix |
 | `404 Provider returned error` | Normal for `openrouter/free` when one provider is down — the action retries up to 5 times; keep `LLM_MODEL=openrouter/free` |
 | `temperature` / `max_tokens` rejected by the model | The action warns, retries once without that parameter (or with `max_completion_tokens`), and keeps that shape for the run. To pin a value some models insist on (Kimi requires `1`), set `llm-temperature` in your workflow's `with:` block, see [docs/ADVANCED.md](docs/ADVANCED.md#models-that-require-a-fixed-temperature) |
-| `reasoning-effort` rejected as unsupported or invalid | The action warns, retries once with no reasoning override, and completes the review when that retry succeeds. Its final status comment tells you to update `reasoning-effort` in `.github/robin.yml` or the workflow `with:` block |
+| `reasoning-effort` rejected as unsupported or invalid | The action warns, retries once with no reasoning override, and completes the review when that retry succeeds. If you set the value yourself, the final status comment tells you to update `reasoning-effort` in `.github/robin.yml` or the workflow `with:` block; a rejected `high` default only shows in the Actions log. Set `reasoning-effort: off` to stop sending it |
 
 More fixes: [docs/ADVANCED.md#troubleshooting](docs/ADVANCED.md#troubleshooting)
 

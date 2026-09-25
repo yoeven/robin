@@ -1,6 +1,8 @@
 import {
   DEFAULT_MAX_COMMENTS,
   DEFAULT_ACTION_MAX_DIFF_SIZE,
+  DEFAULT_REASONING_EFFORT,
+  isReasoningEffortConfigured,
   parseRepoConfigYaml,
   resolveJsonResponseMode,
   resolveMaxComments,
@@ -130,8 +132,31 @@ describe("resolveReasoningEffort", () => {
     expect(resolveReasoningEffort("   ", { reasoningEffort: "high" })).toBe("high");
   });
 
-  it("stays unset when neither the input nor repo config sets it", () => {
-    expect(resolveReasoningEffort("", undefined)).toBeUndefined();
-    expect(resolveReasoningEffort("  ", {})).toBeUndefined();
+  it("defaults to high when neither the input nor repo config sets it", () => {
+    expect(DEFAULT_REASONING_EFFORT).toBe("high");
+    expect(resolveReasoningEffort("", undefined)).toBe("high");
+    expect(resolveReasoningEffort("  ", {})).toBe("high");
+    expect(resolveReasoningEffort("", { reasoningEffort: "  " })).toBe("high");
+  });
+
+  it("sends nothing when the value is off, in any case", () => {
+    expect(resolveReasoningEffort("off", undefined)).toBeUndefined();
+    expect(resolveReasoningEffort(" OFF ", { reasoningEffort: "high" })).toBeUndefined();
+    expect(resolveReasoningEffort("", { reasoningEffort: "Off" })).toBeUndefined();
+  });
+
+  it("keeps none as a provider value rather than an opt-out", () => {
+    expect(resolveReasoningEffort("none", undefined)).toBe("none");
+  });
+});
+
+describe("isReasoningEffortConfigured", () => {
+  it("is true only when the user set a value via input or repo config", () => {
+    expect(isReasoningEffortConfigured("high", undefined)).toBe(true);
+    expect(isReasoningEffortConfigured("", { reasoningEffort: "low" })).toBe(true);
+    expect(isReasoningEffortConfigured("off", undefined)).toBe(true);
+    expect(isReasoningEffortConfigured("", undefined)).toBe(false);
+    expect(isReasoningEffortConfigured("  ", {})).toBe(false);
+    expect(isReasoningEffortConfigured("", { reasoningEffort: "  " })).toBe(false);
   });
 });

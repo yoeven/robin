@@ -20,6 +20,7 @@ import { annotateDiffWithLineNumbers } from "./diff-annotate";
 import {
   DEFAULT_CONFIG_FILE,
   RepoConfig,
+  isReasoningEffortConfigured,
   parseRepoConfigYaml,
   resolveJsonResponseMode,
   resolveMaxComments,
@@ -207,8 +208,13 @@ async function run(): Promise<void> {
     const jsonResponseMode = resolveJsonResponseMode(jsonResponseModeInput, repoConfig);
     const requestChanges = resolveRequestChanges(requestChangesInput, repoConfig);
     const reasoningEffort = resolveReasoningEffort(reasoningEffortInput, repoConfig);
+    const reasoningEffortConfigured = isReasoningEffortConfigured(reasoningEffortInput, repoConfig);
     if (reasoningEffort) {
-      core.info(`Reasoning effort: ${reasoningEffort}`);
+      core.info(
+        `Reasoning effort: ${reasoningEffort}${reasoningEffortConfigured ? "" : " (default; set reasoning-effort: off to send none)"}`
+      );
+    } else {
+      core.info("Reasoning effort: off (no reasoning configuration sent)");
     }
 
     const diff = await gitUtils.getPullRequestDiff(owner, repo, prNumber);
@@ -296,6 +302,10 @@ async function run(): Promise<void> {
       reasoningEffort
     );
     const useJsonMode = command === "review" && jsonResponseMode;
+    // Only a user-configured effort earns a PR-visible "fix your config" notice; a rejected
+    // default falls back quietly in the logs.
+    const reasoningNoticeReason = (): ReasoningFallbackReason | undefined =>
+      reasoningEffortConfigured ? llm.getReasoningFallbackReason() : undefined;
     
     let reviewText: string;
     if (command === "summary") {
@@ -317,7 +327,7 @@ async function run(): Promise<void> {
         owner,
         repo,
         statusCommentId,
-        buildCompletedStatusBody("summary", undefined, llm.getReasoningFallbackReason())
+        buildCompletedStatusBody("summary", undefined, reasoningNoticeReason())
       );
     } else {
       // Full review parsed and posted as a review
@@ -359,7 +369,7 @@ async function run(): Promise<void> {
         owner,
         repo,
         statusCommentId,
-        buildCompletedStatusBody("review", findings, llm.getReasoningFallbackReason())
+        buildCompletedStatusBody("review", findings, reasoningNoticeReason())
       );
 
       if (findings.high.length > 0 && failOnHigh) {

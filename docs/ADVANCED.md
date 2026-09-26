@@ -12,6 +12,9 @@ max-comments: 10
 json-response-mode: true
 request-changes: true
 # reasoning-effort: high   # default; provider-dependent. Set "off" to send no reasoning configuration
+# agent-mode: auto   # default; set off for single-shot diff review only
+# agent-max-turns: 40
+# agent-max-diff-size: 200000
 skip-paths:
   - "**/generated/**"
 ```
@@ -23,6 +26,9 @@ skip-paths:
 | `json-response-mode` | Used when `use-json-response-mode` is empty (action default defers to this file) |
 | `request-changes` | Used when `request-changes` input is empty. `true` (default) blocks on high findings; `false` posts advisor-only comments |
 | `reasoning-effort` | Used when the `reasoning-effort` action/workflow input is empty. Provider-dependent reasoning value; defaults to `high` when unset, `off` sends no reasoning configuration |
+| `agent-mode` | Used when the `agent-mode` input is empty. `auto` (default) runs the [multi-turn agent review](#agent-mode-multi-turn-review-with-repository-context); `off` runs the single-shot diff review |
+| `agent-max-turns` | Used when the `agent-max-turns` input is empty. Tool-calling turns before the final review is requested (default `40`, max `100`) |
+| `agent-max-diff-size` | Used when the `agent-max-diff-size` input is empty. Diff characters sent up front in agent mode (default `200000`); `max-diff-size` still applies to the single-shot fallback |
 | `skip-paths` | Extra paths removed from the diff before the LLM call |
 
 Lockfiles (npm, yarn, pnpm, Cargo, Gemfile, poetry), `dist/`, `node_modules/`, and minified assets are always skipped automatically. If every changed file is skipped, the action posts a status comment and skips the LLM call.
@@ -126,6 +132,62 @@ Available on the [direct action](../action.yml) and the [reusable workflow](../.
 | `review-instructions-file` | `.github/code-reviewer.md` | Rules file on the base branch |
 | `config-file` | `.github/robin.yml` | Repo config path on the base branch |
 | `use-json-response-mode` | empty (defer to repo config, else true) | Request `response_format: json_object` when supported. Pass `"true"` / `"false"` on the reusable workflow |
+| `agent-mode` | empty (defer to repo config, then `auto`) | `auto` lets the model read the repository with tools before reviewing, falling back to the single-shot diff review when the model has no tool support; `off` always uses the single-shot review |
+| `agent-max-turns` | empty (defer to repo config, then `40`) | Maximum tool-calling turns in agent mode (capped at 100) |
+| `agent-max-diff-size` | empty (defer to repo config, then `200000`) | Diff characters sent up front in agent mode. The model reads any truncated files with its tools; `max-diff-size` still applies to the single-shot fallback |
+
+## Agent mode (multi-turn review with repository context)
+
+By default (`agent-mode: auto`), `/review` is a multi-turn conversation instead of a
+single request:
+
+1. Robin downloads the PR head commit as a tarball through the GitHub API and unpacks it
+   into the runner's temp directory. No `actions/checkout` step is needed, and the code is
+   only read, never executed.
+2. The model gets the line-numbered diff plus three read-only tools: `read_file`, `grep`,
+   and `list_files`. It uses them to read full files, find callers of changed functions,
+   and look up definitions before it decides something is a bug.
+3. When it has enough context it returns the usual JSON review. Findings can include an
+   exact replacement for the affected lines, which Robin posts as a one-click GitHub
+   **suggested change** when every line in the range is in the same diff hunk.
+
+The defaults favor finding bugs over saving tokens, sized for frontier models with
+200k-token or larger context windows:
+
+| Limit | Default |
+| --- | --- |
+| Tool-calling turns | 40 (`agent-max-turns`, max 100) |
+| Diff sent up front | 200k characters (`agent-max-diff-size`); the single-shot fallback keeps `max-diff-size` (50k) so small-context models still fit |
+| Tool calls per turn | 16 |
+| Investigation time | 30 minutes |
+| Output per tool call | about 50k characters (`read_file` returns up to 2000 lines and says where to continue) |
+| `grep` | 300 matches, optional `context_lines` (0-5), files up to 2 MB, up to 100k files scanned |
+| `list_files` | 2000 entries |
+| Repository snapshot | 500 MB compressed |
+
+When the turn or time limit runs out, Robin asks the model for its final review without
+tools.
+
+**Context compaction.** The diff and the tool output kept in the conversation share a
+budget of about 450k characters (roughly 115-150k tokens). Tool output always gets at least
+150k of it, so the larger the diff, the sooner compaction starts. Once tool output passes
+its share, or whenever the provider reports that the context window is full, Robin compacts the conversation the way Cursor does. The model writes
+notes about the investigation so far: suspected bugs with evidence, facts it established,
+what it already checked, and what's left. Robin then continues from those notes plus the
+latest tool turn. If the summary request itself fails, Robin falls back to dropping the
+oldest tool results. A review can compact up to six times.
+
+**Fallback.** If the model or provider rejects tool calling (for example OpenRouter's
+"No endpoints found that support tool use", or Ollama's "does not support tools"), the
+snapshot download fails, or the agent loop errors, Robin logs a warning and runs the
+single-shot diff review instead, so the PR still gets a review. `/summary` is always
+single-shot.
+
+Agent mode sends more tokens than a single-shot review (the model reads extra files) and
+takes longer. The reusable workflow's job timeout is 45 minutes to leave room for a full
+investigation plus the final answer. Lower `agent-max-turns` if you want faster or cheaper
+reviews. Set
+`agent-mode: off` in `.github/robin.yml` to go back to diff-only reviews.
 
 ## Usage patterns
 
@@ -207,7 +269,7 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - uses: antongulin/robin@main
         with:
@@ -353,7 +415,7 @@ provider-specific effort value.
 3. Author pushes fixes → no automatic re-review (by default).
 4. Maintainer comments `/robin` or `/review` for another pass.
 
-The action fetches diffs via the GitHub API. `actions/checkout` is not required unless other steps need local files.
+The action fetches diffs and, in agent mode, a read-only tarball of the PR head through the GitHub API. `actions/checkout` is not required unless other steps need local files.
 
 ## Model robustness
 
@@ -374,9 +436,12 @@ constraints in mind — they are why reviews stay usable across models:
   from severity. The parser ignores invalid values, and the Robin skill uses confidence
   to decide how hard to verify a finding before acting on it. Severity orders effort;
   confidence gates trust.
-- **"You only see the diff" guard.** The prompt reminds the model it sees changed lines
-  only, not the whole file — so it doesn't invent bugs about code it can't see. The
-  companion skill mirrors this: it treats findings as hypotheses to verify, not orders.
+- **"You only see the diff" guard.** The single-shot prompt reminds the model it sees
+  changed lines only, not the whole file — so it doesn't invent bugs about code it can't
+  see. The agent-mode prompt replaces this with "verify with the tools before flagging".
+  The companion skill mirrors this: it treats findings as hypotheses to verify, not orders.
+- **Graceful tool fallback.** Agent mode is only used when the model accepts tool calls;
+  otherwise the same single-shot prompt runs, so weak or free models keep working.
 
 The parser (`src/review-parser.ts`) is deliberately forgiving — it normalizes severity,
 drops unparseable findings, and falls back to a markdown review if JSON mode fails — so a
@@ -384,7 +449,7 @@ malformed response from a weak model degrades instead of crashing the run.
 
 ## Security and privacy
 
-PR diffs are sent to **your** configured LLM endpoint.
+PR diffs are sent to **your** configured LLM endpoint. In agent mode, any repository file the model reads with its tools is sent there too.
 
 | Setup | Where code goes |
 | --- | --- |
@@ -399,6 +464,7 @@ Practices:
 - Do not use `pull_request_target` with this action.
 - Keep slash commands at `min-command-permission: write` unless you accept cost/abuse risk.
 - Fork PRs from outsiders may not receive secrets — use manual `/review` from a maintainer.
+- Agent-mode tools are read-only and confined to the extracted snapshot: paths and symlinks that resolve outside it are rejected, and PR code is never executed.
 
 ## Limits
 
@@ -418,7 +484,7 @@ No daily quota from this action. Real limits:
 | `Input required: llm-base-url` | Missing secret | Add `LLM_BASE_URL` |
 | `Empty response from LLM` | Free/unstable model returned no text | Action retries with backoff; comment `/review` again |
 | `OpenRouter stall: no first response` | Auto-router hung before picking a provider | Action retries every 45s (up to 5×); PR status comment updates each attempt |
-| Job cancelled / 15 min with no review | Hung LLM or concurrency cancel while waiting | Status comment should say interrupted — comment `/robin` again; pin `@v2.0.4`+ for stall detect |
+| Job cancelled / 45 min with no review | Hung LLM or concurrency cancel while waiting | Status comment should say interrupted — comment `/robin` again; pin `@v2.0.4`+ for stall detect |
 | `404 Provider returned error` | OpenRouter free route missed one provider | Keep `LLM_MODEL=openrouter/free` — action retries (5×) with provider fallbacks; no secret updates when models rotate |
 | `Request timed out` | Large PR or slow free model | Lower `max-diff-size` or raise `llm-timeout-ms` (router models default to 2 min per attempt) |
 | `temperature` / `max_tokens` / `response_format` rejected | Newer model refuses an optional parameter (OpenAI reasoning models, Kimi) | Action warns, retries once without it (`max_tokens` → `max_completion_tokens`), and keeps that shape for the run; set `llm-temperature` only to pin a specific value (Kimi: `1`) |

@@ -202,6 +202,52 @@ export function findUnsupportedRequestParam(
   return sentParams.find((param) => new RegExp(`(?:^|[^\\w])${param}(?:$|[^\\w])`, "i").test(message));
 }
 
+const TOOL_NOUN = String.raw`(?:tools?|tool[\s_-]?(?:use|calling|calls|choice)|function[\s_-]?calling)`;
+
+/** Provider phrasings for "this model/route cannot take tools" (OpenRouter, Ollama, vLLM, generic). */
+const TOOLS_UNSUPPORTED_PHRASES: RegExp[] = [
+  /\bno\s+endpoints?\s+found\s+that\s+supports?\b[^.]{0,40}\btool/i,
+  new RegExp(String.raw`\b(?:does|do|did)\s+not\s+support\s+${TOOL_NOUN}\b`, "i"),
+  new RegExp(
+    String.raw`\b${TOOL_NOUN}\b[^.;!?]{0,40}\b(?:not\s+supported|unsupported|not\s+enabled|not\s+available)\b`,
+    "i"
+  ),
+  /\b(?:unsupported|unknown|unrecognized|unrecognised|unexpected|extra)\s+(?:parameters?|arguments?|fields?|propert(?:y|ies)|inputs?)\b[^.;!?,]{0,40}\b(?:tools|tool_choice)\b/i,
+  /\btool[\s_-]?choice\b[^.]{0,40}\brequires\b/i,
+  /--enable-auto-tool-choice/i,
+];
+
+/**
+ * True when the provider rejects the request because the model or route cannot use tools.
+ * OpenRouter reports this as a 404 ("No endpoints found that support tool use"), which the
+ * router retry logic would otherwise treat as a transient routing miss.
+ */
+export function isToolsUnsupportedError(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === "object" && error !== null && "status" in error) {
+    const status = Number((error as { status?: unknown }).status);
+    if (Number.isFinite(status) && ![400, 404, 405, 422, 501].includes(status)) return false;
+    const param = (error as { param?: unknown }).param;
+    if (typeof param === "string" && /^(?:tools|tool_choice)$/i.test(param)) return true;
+  }
+  const message = errorMessage(error);
+  return TOOLS_UNSUPPORTED_PHRASES.some((pattern) => pattern.test(message));
+}
+
+const CONTEXT_LENGTH_PHRASES =
+  /\b(?:context[_\s-]?length(?:[_\s-]?exceeded)?|context[_\s-]window|maximum\s+context|prompt\s+is\s+too\s+long|input\s+is\s+too\s+long|too\s+many\s+(?:input\s+)?tokens|reduce\s+the\s+length\s+of\s+the\s+(?:messages|prompt|input)|exceeds?\s+(?:the\s+)?(?:model'?s?\s+)?(?:maximum|max)\s+(?:context|input|prompt|token)|request\s+entity\s+too\s+large|payload\s+too\s+large)/i;
+
+/** The conversation no longer fits the model's context window (OpenAI, Anthropic, OpenRouter, vLLM phrasings). */
+export function isContextLengthError(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === "object" && error !== null && "status" in error) {
+    const status = Number((error as { status?: unknown }).status);
+    if (status === 413) return true;
+    if (Number.isFinite(status) && status !== 400 && status !== 422) return false;
+  }
+  return CONTEXT_LENGTH_PHRASES.test(errorMessage(error));
+}
+
 export function isRetriableLlmError(error: unknown, context: LlmRetryContext = {}): boolean {
   if (!error) return false;
 

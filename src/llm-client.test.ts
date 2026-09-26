@@ -5,7 +5,7 @@ jest.mock("@actions/core", () => ({
 }));
 
 import * as core from "@actions/core";
-import { LLMClient } from "./llm-client";
+import { LLMClient, ToolsUnsupportedError } from "./llm-client";
 
 const warningMock = core.warning as unknown as jest.Mock;
 
@@ -861,5 +861,124 @@ describe("LLMClient reasoning fallback", () => {
     expect(create).toHaveBeenCalledTimes(3);
     expect(create.mock.calls[2][0]).not.toHaveProperty("reasoning");
     expect(fallbackWarnings()).toHaveLength(1);
+  });
+});
+
+describe("LLMClient tool calling", () => {
+  const tools = [
+    {
+      type: "function" as const,
+      function: { name: "read_file", parameters: { type: "object", properties: {} } },
+    },
+  ];
+  const messages = [
+    { role: "system" as const, content: "system" },
+    { role: "user" as const, content: "user" },
+  ];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("sends tools and tool_choice without response_format", async () => {
+    const client = makeClient("https://api.openai.com/v1", "gpt-4o");
+    const create = stubOpenAI(client);
+    create.mockResolvedValueOnce(completionResponse("done"));
+
+    await client.chatWithTools(messages, tools, { toolChoice: "none" });
+
+    const request = create.mock.calls[0][0];
+    expect(request.tools).toEqual(tools);
+    expect(request.tool_choice).toBe("none");
+    expect(request).not.toHaveProperty("response_format");
+    expect(request.messages).toEqual(messages);
+  });
+
+  it("returns tool calls from a blocking response with empty content", async () => {
+    const client = makeClient("https://api.openai.com/v1", "gpt-4o");
+    const create = stubOpenAI(client);
+    create.mockResolvedValueOnce({
+      model: "gpt-4o",
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              { id: "call_1", type: "function", function: { name: "read_file", arguments: '{"path":"a.ts"}' } },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    });
+
+    const result = await client.chatWithTools(messages, tools);
+
+    expect(result.content).toBe("");
+    expect(result.toolCalls).toEqual([{ id: "call_1", name: "read_file", arguments: '{"path":"a.ts"}' }]);
+    expect(warningMock).not.toHaveBeenCalledWith(expect.stringContaining("no text content"));
+  });
+
+  it("assembles streamed tool-call deltas for router models", async () => {
+    const client = makeClient("https://openrouter.ai/api/v1", "openrouter/free");
+    const create = stubOpenAI(client);
+    create.mockResolvedValueOnce(
+      streamOf([
+        {
+          model: "vendor/model",
+          choices: [{ delta: { tool_calls: [{ index: 0, id: "call_a", function: { name: "grep", arguments: '{"pat' } }] } }],
+        },
+        {
+          model: "vendor/model",
+          choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'tern":"x"}' } }] } }],
+        },
+        {
+          model: "vendor/model",
+          choices: [{ delta: { tool_calls: [{ index: 1, function: { name: "list_files", arguments: "{}" } }] } }],
+        },
+      ]),
+    );
+
+    const result = await client.chatWithTools(messages, tools);
+
+    expect(result.toolCalls).toEqual([
+      { id: "call_a", name: "grep", arguments: '{"pattern":"x"}' },
+      { id: "call_1", name: "list_files", arguments: "{}" },
+    ]);
+  });
+
+  it("throws ToolsUnsupportedError without retrying when a router has no tool-capable endpoint", async () => {
+    const client = new LLMClient("https://openrouter.ai/api/v1", "k", "openrouter/free");
+    const create = stubOpenAI(client);
+    create.mockRejectedValue(
+      Object.assign(new Error("404 No endpoints found that support tool use. Try disabling \"read_file\"."), {
+        status: 404,
+      }),
+    );
+
+    await expect(client.chatWithTools(messages, tools)).rejects.toBeInstanceOf(ToolsUnsupportedError);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps normal router 404 retries for plain completions", async () => {
+    const client = makeClient("https://openrouter.ai/api/v1", "openrouter/free");
+    const create = stubOpenAI(client);
+    create.mockRejectedValue(
+      Object.assign(new Error("404 No endpoints found that support tool use."), { status: 404 }),
+    );
+
+    await expect(client.chatCompletion("system", "user")).rejects.not.toBeInstanceOf(ToolsUnsupportedError);
+  });
+});
+
+describe("LLMClient context-length errors on router streams", () => {
+  it("surfaces a context-length rejection instead of treating it as a router stall", async () => {
+    const client = makeClient("https://openrouter.ai/api/v1", "openrouter/free");
+    const create = stubOpenAI(client);
+    create.mockRejectedValue(
+      Object.assign(new Error("400 This endpoint's maximum context length is 131072 tokens."), { status: 400 }),
+    );
+
+    await expect(client.chatCompletion("system", "user")).rejects.toThrow(/maximum context length/);
   });
 });

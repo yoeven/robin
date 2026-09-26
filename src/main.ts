@@ -1,6 +1,9 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
-import { LLMClient } from "./llm-client";
+import { LLMClient, ToolsUnsupportedError } from "./llm-client";
+import { runAgentReview } from "./agent-review";
+import { createRepoSnapshot } from "./repo-snapshot";
+import { ReviewToolbox } from "./review-tools";
 import {
   buildReasoningFallbackNotice,
   ReasoningFallbackReason,
@@ -18,10 +21,14 @@ import {
 import { filterDiff, splitDiffIntoFiles } from "./diff-filter";
 import { annotateDiffWithLineNumbers } from "./diff-annotate";
 import {
+  AgentMode,
   DEFAULT_CONFIG_FILE,
   RepoConfig,
   isReasoningEffortConfigured,
   parseRepoConfigYaml,
+  resolveAgentMaxDiffSize,
+  resolveAgentMaxTurns,
+  resolveAgentMode,
   resolveJsonResponseMode,
   resolveMaxComments,
   resolveMaxDiffSize,
@@ -152,6 +159,9 @@ async function run(): Promise<void> {
     const configFile = core.getInput("config-file") || DEFAULT_CONFIG_FILE;
     const jsonResponseModeInput = core.getInput("use-json-response-mode") || "";
     const requestChangesInput = core.getInput("request-changes") || "";
+    const agentModeInput = core.getInput("agent-mode") || "";
+    const agentMaxTurnsInput = core.getInput("agent-max-turns") || "";
+    const agentMaxDiffSizeInput = core.getInput("agent-max-diff-size") || "";
 
     core.info(`Model: ${model || "(not configured)"}`);
 
@@ -209,6 +219,9 @@ async function run(): Promise<void> {
     const requestChanges = resolveRequestChanges(requestChangesInput, repoConfig);
     const reasoningEffort = resolveReasoningEffort(reasoningEffortInput, repoConfig);
     const reasoningEffortConfigured = isReasoningEffortConfigured(reasoningEffortInput, repoConfig);
+    const agentMode = resolveAgentMode(agentModeInput, repoConfig);
+    const agentMaxTurns = resolveAgentMaxTurns(agentMaxTurnsInput, repoConfig);
+    const agentMaxDiffSize = resolveAgentMaxDiffSize(agentMaxDiffSizeInput, repoConfig);
     if (reasoningEffort) {
       core.info(
         `Reasoning effort: ${reasoningEffort}${reasoningEffortConfigured ? "" : " (default; set reasoning-effort: off to send none)"}`
@@ -262,12 +275,11 @@ async function run(): Promise<void> {
       return;
     }
 
-    const truncatedDiff = reviewDiff.length > maxDiffSize 
-      ? reviewDiff.slice(0, maxDiffSize) + "\n\n[... Diff truncated due to size limit]"
-      : reviewDiff;
+    const truncatedDiff = truncateDiff(reviewDiff, maxDiffSize);
+    const agentDiff = truncateDiff(reviewDiff, agentMaxDiffSize);
 
     core.info(
-      `Diff size: ${reviewDiff.length} chars${reviewDiff.length > maxDiffSize ? " (truncated)" : ""}${removedFiles.length > 0 ? ` (${removedFiles.length} file(s) filtered)` : ""}`
+      `Diff size: ${reviewDiff.length} chars (single-shot limit ${maxDiffSize}${reviewDiff.length > maxDiffSize ? ", truncated" : ""}; agent limit ${agentMaxDiffSize}${reviewDiff.length > agentMaxDiffSize ? ", truncated" : ""})${removedFiles.length > 0 ? ` (${removedFiles.length} file(s) filtered)` : ""}`
     );
     const reviewInstructions = command === "review"
       ? await loadReviewInstructions(
@@ -311,7 +323,30 @@ async function run(): Promise<void> {
     if (command === "summary") {
       reviewText = (await runSummary(llm, truncatedDiff)).content;
     } else {
-      reviewText = (await runReview(llm, truncatedDiff, reviewInstructions, useJsonMode)).content;
+      reviewText = await runAgentOrSingleShotReview({
+        octokit,
+        owner,
+        repo,
+        prNumber,
+        headSha: payload.pull_request?.head?.sha,
+        llm,
+        diff: truncatedDiff,
+        agentDiff,
+        changedFiles: splitDiffIntoFiles(reviewDiff).map((file) => file.path),
+        reviewInstructions,
+        useJsonMode,
+        agentMode,
+        agentMaxTurns,
+        onProgress: async (detail) => {
+          await updateStatusComment(
+            octokit!,
+            owner,
+            repo,
+            statusCommentId,
+            buildProgressStatusBody(detail, statusCommand, statusModel)
+          );
+        },
+      });
     }
 
     if (command === "summary") {
@@ -743,6 +778,99 @@ async function runReview(
   const userContent = buildReviewInput(diff);
   core.info("Getting full code review...");
   return await llm.chatCompletion(systemPrompt, userContent, jsonResponseMode);
+}
+
+function truncateDiff(diff: string, limit: number): string {
+  return diff.length > limit ? diff.slice(0, limit) + "\n\n[... Diff truncated due to size limit]" : diff;
+}
+
+const AGENT_PROGRESS_MIN_INTERVAL_MS = 3000;
+
+interface AgentOrSingleShotParams {
+  octokit: ReturnType<typeof github.getOctokit>;
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha?: string;
+  llm: LLMClient;
+  /** Diff for the single-shot review, truncated to max-diff-size. */
+  diff: string;
+  /** Diff for agent mode, truncated to agent-max-diff-size. */
+  agentDiff: string;
+  changedFiles: string[];
+  reviewInstructions: string;
+  useJsonMode: boolean;
+  agentMode: AgentMode;
+  agentMaxTurns: number;
+  onProgress: (detail: string) => Promise<void>;
+}
+
+/**
+ * Multi-turn review with repository tools when possible; any failure to set it up or run it
+ * (no tool support, snapshot download error, provider error mid-loop) falls back to the
+ * single-shot diff review so a PR always gets a review.
+ */
+async function runAgentOrSingleShotReview(params: AgentOrSingleShotParams): Promise<string> {
+  const singleShot = async () =>
+    (await runReview(params.llm, params.diff, params.reviewInstructions, params.useJsonMode)).content;
+
+  if (params.agentMode === "off") {
+    core.info("Agent mode is off; running single-shot diff review.");
+    return singleShot();
+  }
+
+  let snapshot: Awaited<ReturnType<typeof createRepoSnapshot>>;
+  try {
+    const headSha = params.headSha || (await fetchHeadSha(params.octokit, params.owner, params.repo, params.prNumber));
+    await params.onProgress("Downloading the repository snapshot for context…");
+    snapshot = await createRepoSnapshot(params.octokit as any, params.owner, params.repo, headSha);
+  } catch (error) {
+    core.warning(`Could not prepare repository snapshot (${error}); running single-shot diff review.`);
+    return singleShot();
+  }
+
+  let lastProgressAt = 0;
+  const throttledProgress = async (detail: string) => {
+    const now = Date.now();
+    if (now - lastProgressAt < AGENT_PROGRESS_MIN_INTERVAL_MS) return;
+    lastProgressAt = now;
+    await params.onProgress(detail);
+  };
+
+  try {
+    core.info(`Running agent review (max ${params.agentMaxTurns} turns)...`);
+    const result = await runAgentReview({
+      llm: params.llm,
+      toolbox: new ReviewToolbox(snapshot.root),
+      annotatedDiff: annotateDiffWithLineNumbers(params.agentDiff),
+      changedFiles: params.changedFiles,
+      instructions: params.reviewInstructions,
+      budgets: { maxTurns: params.agentMaxTurns },
+      onProgress: throttledProgress,
+    });
+    return result.content;
+  } catch (error) {
+    if (error instanceof ToolsUnsupportedError) {
+      core.warning(`${error.message}. Running single-shot diff review instead.`);
+      await params.onProgress("Model doesn't support tool calling — running a diff-only review…");
+    } else {
+      core.warning(`Agent review failed (${error}); running single-shot diff review instead.`);
+      await params.onProgress("Agent review failed — retrying as a diff-only review…");
+    }
+    return singleShot();
+  } finally {
+    await snapshot.cleanup();
+  }
+}
+
+async function fetchHeadSha(
+  octokit: ReturnType<typeof github.getOctokit>,
+  owner: string,
+  repo: string,
+  prNumber: number
+): Promise<string> {
+  const { data } = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
+  return data.head.sha;
 }
 
 async function runSummary(llm: LLMClient, diff: string) {

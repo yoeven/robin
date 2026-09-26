@@ -60,7 +60,7 @@ on:
         type: string
         default: ""
       review-on-synchronize:
-        description: "Run automatic reviews after each new commit pushed to a PR."
+        description: "Deprecated and ignored; kept so existing callers keep working. Pushes are reviewed whenever the caller triggers on synchronize."
         required: false
         type: boolean
         default: false

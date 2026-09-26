@@ -1932,7 +1932,6 @@ async function run() {
         const token = core.getInput("github-token", { required: true });
         octokit = github.getOctokit(token);
         const minCommandPermission = core.getInput("min-command-permission") || "write";
-        const reviewOnSynchronize = core.getBooleanInput("review-on-synchronize");
         core.info(`Event: ${eventName}`);
         const owner = github.context.repo.owner;
         const repo = github.context.repo.repo;
@@ -1946,10 +1945,6 @@ async function run() {
             return;
         }
         if (eventName === "pull_request") {
-            if (payload.action === "synchronize" && !reviewOnSynchronize) {
-                core.info("Skipping pull_request synchronize event. Pushes to an existing PR are reviewed manually with /review unless review-on-synchronize is true.");
-                return;
-            }
             shouldRun = true;
             prNumber = payload.pull_request?.number;
         }

@@ -53,7 +53,7 @@ inputs:
     required: false
     default: "15"
   review-on-synchronize:
-    description: "Run automatic reviews for pull_request synchronize events, which happen after each new commit pushed to a PR. Set to true only if you want review on every push."
+    description: "Deprecated and ignored. Robin reviews every pull_request event the workflow triggers on, including synchronize (new commits pushed to a PR); remove synchronize from the workflow trigger to review only on open."
     required: false
     default: "false"
   min-command-permission:

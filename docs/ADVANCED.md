@@ -86,7 +86,7 @@ jobs:
 
 ### Save GitHub Actions minutes
 
-- Keep the default flow: one review on PR open, then `/review` after fixes (do not enable `review-on-synchronize` unless you need it).
+- Drop `synchronize` from the trigger so Robin reviews once when the PR opens and you comment `/review` after fixes (see [Review only when the PR opens](#review-only-when-the-pr-opens)).
 - Use a smaller `max-diff-size` for huge PRs.
 - **Free tier:** GitHub Free includes about **2,000 Actions minutes/month** for public and private repos; GitHub Pro about **3,000 minutes/month** (limits can change — see [GitHub billing](https://docs.github.com/en/billing/concepts/product-billing/github-actions) for your account).
 - **Heavy usage:** use a [self-hosted runner](https://docs.github.com/en/actions/hosting-your-own-runners) so LLM wait time does not consume hosted minutes.
@@ -125,7 +125,7 @@ Available on the [direct action](../action.yml) and the [reusable workflow](../.
 | `llm-timeout-ms` | `600000` | LLM timeout (10 minutes) |
 | `llm-temperature` | `0.1` | Sampling temperature (0–2). Raise only if your model rejects the default — some models accept a single fixed value (Kimi requires `1`) |
 | `max-comments` | `15` | Max inline comments |
-| `review-on-synchronize` | `false` | Review every new commit on the PR |
+| `review-on-synchronize` | ignored | Deprecated no-op kept for existing callers. Pushes are reviewed whenever the workflow triggers on `synchronize`, as the default template does |
 | `runner` | `'"ubuntu-latest"'` | Reusable workflow only: runner as a JSON string or JSON array |
 | `min-command-permission` | `write` | Who can run `/review` |
 | `review-instructions` | empty | Extra prompt text |
@@ -212,20 +212,21 @@ jobs:
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
 ```
 
-### Review on every commit
+### Review only when the PR opens
+
+The default template reviews every push to a PR (`synchronize`). To review once when the
+PR opens and re-review only on `/review`, drop `synchronize` from the trigger:
 
 ```yaml
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review]
   issue_comment:
     types: [created]
 
 jobs:
   review:
     uses: antongulin/robin/.github/workflows/review.yml@main
-    with:
-      review-on-synchronize: true
     secrets:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}

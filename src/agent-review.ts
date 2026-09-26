@@ -4,6 +4,7 @@ import { isContextLengthError } from "./llm-retry";
 import { getAgentReviewPrompt } from "./prompts/review-prompts";
 import { DEFAULT_AGENT_MAX_TURNS } from "./repo-config";
 import { REVIEW_TOOLS, ReviewToolbox } from "./review-tools";
+import type { AgentProgress } from "./status-reporter";
 
 export const DEFAULT_AGENT_DEADLINE_MS = 30 * 60 * 1000;
 /**
@@ -37,7 +38,7 @@ export interface AgentReviewOptions {
   changedFiles: string[];
   instructions: string;
   budgets?: Partial<AgentBudgets>;
-  onProgress?: (detail: string) => void | Promise<void>;
+  onProgress?: (progress: AgentProgress) => void | Promise<void>;
   now?: () => number;
 }
 
@@ -64,9 +65,19 @@ export async function runAgentReview(options: AgentReviewOptions): Promise<Agent
   };
   const now = options.now ?? Date.now;
   const deadline = now() + budgets.deadlineMs;
-  const progress = async (detail: string) => {
+  let turns = 0;
+  let toolCallCount = 0;
+  let compactions = 0;
+  const progress = async (phase: AgentProgress["phase"], activity: string) => {
     try {
-      await options.onProgress?.(detail);
+      await options.onProgress?.({
+        turn: Math.max(turns, 1),
+        maxTurns: budgets.maxTurns,
+        toolCalls: toolCallCount,
+        compactions,
+        phase,
+        activity,
+      });
     } catch (error) {
       core.warning(`Agent progress update failed (non-fatal): ${error}`);
     }
@@ -81,7 +92,6 @@ export async function runAgentReview(options: AgentReviewOptions): Promise<Agent
   ];
   let messages = freshMessages();
 
-  let compactions = 0;
   const compact = async (reason: string): Promise<boolean> => {
     if (compactions >= MAX_COMPACTIONS) {
       core.warning(`Compaction limit reached (${reason}); dropping the oldest tool results instead.`);
@@ -94,7 +104,7 @@ export async function runAgentReview(options: AgentReviewOptions): Promise<Agent
 
     compactions++;
     core.info(`Compacting agent context #${compactions}: ${reason}`);
-    await progress("Context is getting full — summarizing the investigation so far…");
+    await progress("compacting", "Context is getting full — summarizing the investigation so far");
     try {
       notes = await summarizeInvestigation(options.llm, summarize, notes);
       messages = [...freshMessages(), ...keep];
@@ -106,8 +116,9 @@ export async function runAgentReview(options: AgentReviewOptions): Promise<Agent
     }
   };
 
-  const callModel = async (toolChoice?: "none") => {
+  const callModel = async (activity: string, toolChoice?: "none") => {
     for (;;) {
+      await progress("model", activity);
       try {
         return await options.llm.chatWithTools(messages, REVIEW_TOOLS, toolChoice ? { toolChoice } : {});
       } catch (error) {
@@ -117,8 +128,6 @@ export async function runAgentReview(options: AgentReviewOptions): Promise<Agent
     }
   };
 
-  let turns = 0;
-  let toolCallCount = 0;
   let stopReason = `reached the ${budgets.maxTurns}-turn limit`;
 
   while (turns < budgets.maxTurns) {
@@ -129,7 +138,7 @@ export async function runAgentReview(options: AgentReviewOptions): Promise<Agent
 
     turns++;
     core.info(`Agent turn ${turns}/${budgets.maxTurns}`);
-    const result = await callModel();
+    const result = await callModel(turns === 1 ? "Reading the diff and planning the investigation" : "Thinking about the next step");
     const calls = result.toolCalls ?? [];
 
     if (calls.length === 0) {
@@ -148,7 +157,7 @@ export async function runAgentReview(options: AgentReviewOptions): Promise<Agent
         toolCallCount++;
         const description = options.toolbox.describe(call.name, call.arguments);
         core.info(`Agent tool: ${description}`);
-        await progress(`${description}… (turn ${turns}/${budgets.maxTurns})`);
+        await progress("tool", description);
         output = await options.toolbox.execute(call.name, call.arguments);
       }
       messages.push({ role: "tool", tool_call_id: call.id, content: output });
@@ -160,14 +169,13 @@ export async function runAgentReview(options: AgentReviewOptions): Promise<Agent
   }
 
   core.info(`Agent ${stopReason}; requesting the final review without tools.`);
-  await progress("Investigation budget used — writing the final review…");
   messages.push({
     role: "user",
     content:
       `You have ${stopReason}. Do not call any more tools. ` +
       "Return the final review now as the single JSON object described in the system prompt.",
   });
-  const final = await callModel("none");
+  const final = await callModel(`Investigation ${stopReason.replace(/^reached/, "hit")} — writing the final review`, "none");
   if (!final.content.trim()) {
     throw new Error("Agent review returned no final answer after the tool budget was used.");
   }

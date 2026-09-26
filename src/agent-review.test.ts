@@ -72,7 +72,12 @@ describe("runAgentReview", () => {
 
     expect(result).toEqual({ content: FINAL_JSON, turns: 2, toolCalls: 2, compactions: 0 });
     expect(toolbox.execute).toHaveBeenCalledTimes(2);
-    expect(progress).toHaveBeenCalledWith(expect.stringContaining("Running read_file"));
+    expect(progress.mock.calls.map(([update]) => update)).toEqual([
+      expect.objectContaining({ phase: "model", turn: 1, toolCalls: 0, activity: expect.stringContaining("planning") }),
+      expect.objectContaining({ phase: "tool", turn: 1, toolCalls: 1, activity: expect.stringContaining("read_file") }),
+      expect.objectContaining({ phase: "tool", turn: 1, toolCalls: 2, activity: expect.stringContaining("grep") }),
+      expect.objectContaining({ phase: "model", turn: 2, toolCalls: 2, activity: "Thinking about the next step" }),
+    ]);
 
     const [first, second] = calls;
     expect(first.messages[0]).toMatchObject({ role: "system" });

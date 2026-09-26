@@ -80,9 +80,19 @@ async function runAgentReview(options) {
     };
     const now = options.now ?? Date.now;
     const deadline = now() + budgets.deadlineMs;
-    const progress = async (detail) => {
+    let turns = 0;
+    let toolCallCount = 0;
+    let compactions = 0;
+    const progress = async (phase, activity) => {
         try {
-            await options.onProgress?.(detail);
+            await options.onProgress?.({
+                turn: Math.max(turns, 1),
+                maxTurns: budgets.maxTurns,
+                toolCalls: toolCallCount,
+                compactions,
+                phase,
+                activity,
+            });
         }
         catch (error) {
             core.warning(`Agent progress update failed (non-fatal): ${error}`);
@@ -96,7 +106,6 @@ async function runAgentReview(options) {
         { role: "user", content: notes ? `${baseInput}\n\n${compactedNotesBlock(notes)}` : baseInput },
     ];
     let messages = freshMessages();
-    let compactions = 0;
     const compact = async (reason) => {
         if (compactions >= MAX_COMPACTIONS) {
             core.warning(`Compaction limit reached (${reason}); dropping the oldest tool results instead.`);
@@ -108,7 +117,7 @@ async function runAgentReview(options) {
         }
         compactions++;
         core.info(`Compacting agent context #${compactions}: ${reason}`);
-        await progress("Context is getting full — summarizing the investigation so far…");
+        await progress("compacting", "Context is getting full — summarizing the investigation so far");
         try {
             notes = await summarizeInvestigation(options.llm, summarize, notes);
             messages = [...freshMessages(), ...keep];
@@ -120,8 +129,9 @@ async function runAgentReview(options) {
             return elideOldestToolOutputs(messages, Math.floor(budgets.maxContextChars / 2));
         }
     };
-    const callModel = async (toolChoice) => {
+    const callModel = async (activity, toolChoice) => {
         for (;;) {
+            await progress("model", activity);
             try {
                 return await options.llm.chatWithTools(messages, review_tools_1.REVIEW_TOOLS, toolChoice ? { toolChoice } : {});
             }
@@ -133,8 +143,6 @@ async function runAgentReview(options) {
             }
         }
     };
-    let turns = 0;
-    let toolCallCount = 0;
     let stopReason = `reached the ${budgets.maxTurns}-turn limit`;
     while (turns < budgets.maxTurns) {
         if (now() >= deadline) {
@@ -143,7 +151,7 @@ async function runAgentReview(options) {
         }
         turns++;
         core.info(`Agent turn ${turns}/${budgets.maxTurns}`);
-        const result = await callModel();
+        const result = await callModel(turns === 1 ? "Reading the diff and planning the investigation" : "Thinking about the next step");
         const calls = result.toolCalls ?? [];
         if (calls.length === 0) {
             core.info(`Agent finished after ${turns} turn(s), ${toolCallCount} tool call(s), ${compactions} compaction(s).`);
@@ -159,7 +167,7 @@ async function runAgentReview(options) {
                 toolCallCount++;
                 const description = options.toolbox.describe(call.name, call.arguments);
                 core.info(`Agent tool: ${description}`);
-                await progress(`${description}… (turn ${turns}/${budgets.maxTurns})`);
+                await progress("tool", description);
                 output = await options.toolbox.execute(call.name, call.arguments);
             }
             messages.push({ role: "tool", tool_call_id: call.id, content: output });
@@ -169,13 +177,12 @@ async function runAgentReview(options) {
         }
     }
     core.info(`Agent ${stopReason}; requesting the final review without tools.`);
-    await progress("Investigation budget used — writing the final review…");
     messages.push({
         role: "user",
         content: `You have ${stopReason}. Do not call any more tools. ` +
             "Return the final review now as the single JSON object described in the system prompt.",
     });
-    const final = await callModel("none");
+    const final = await callModel(`Investigation ${stopReason.replace(/^reached/, "hit")} — writing the final review`, "none");
     if (!final.content.trim()) {
         throw new Error("Agent review returned no final answer after the tool budget was used.");
     }
@@ -1881,6 +1888,8 @@ const llm_client_1 = __nccwpck_require__(3316);
 const agent_review_1 = __nccwpck_require__(3265);
 const repo_snapshot_1 = __nccwpck_require__(6330);
 const review_tools_1 = __nccwpck_require__(7635);
+const status_reporter_1 = __nccwpck_require__(7001);
+const version_1 = __nccwpck_require__(7913);
 const reasoning_fallback_1 = __nccwpck_require__(2432);
 const git_utils_1 = __nccwpck_require__(8529);
 const review_parser_1 = __nccwpck_require__(2141);
@@ -1899,6 +1908,7 @@ async function run() {
     let statusCommentId;
     let statusCommand = "review";
     let statusModel = "not configured";
+    let reporter;
     let onJobCancelled;
     try {
         const eventName = github.context.eventName;
@@ -1992,8 +2002,17 @@ async function run() {
         core.info(`Running /${command} on PR #${prNumber} in ${owner}/${repo}`);
         statusCommand = command === "summary" ? "summary" : "review";
         statusModel = model || "not configured";
+        robinVersion = await (0, version_1.describeRobinVersion)(octokit);
+        core.info(`Robin ${robinVersion}`);
         statusCommentId = await postStatusComment(octokit, owner, repo, prNumber, command, statusModel);
+        const commentId = statusCommentId;
+        reporter = new status_reporter_1.StatusReporter((body) => updateStatusComment(octokit, owner, repo, commentId, body), {
+            model: statusModel,
+            mode: command === "summary" ? "summary" : "code review",
+            version: () => robinVersion,
+        });
         onJobCancelled = async () => {
+            await Promise.race([reporter?.close(), new Promise((resolve) => setTimeout(resolve, 1000).unref())]);
             if (octokit && statusCommentId) {
                 // The SIGTERM grace period is short — never let the superseded check
                 // delay the status update past it. On timeout the check is abandoned
@@ -2064,19 +2083,18 @@ async function run() {
         const reviewInstructions = command === "review"
             ? await loadReviewInstructions(octokit, gitUtils, owner, repo, prNumber, inlineReviewInstructions, reviewInstructionsFile, baseRef)
             : "";
-        const llm = new llm_client_1.LLMClient(baseUrl, apiKey, model, maxOutputTokens, llmTimeoutMs, undefined, llmTemperature, async (detail) => {
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildProgressStatusBody(detail, statusCommand, statusModel));
-        }, reasoningEffort);
+        const llm = new llm_client_1.LLMClient(baseUrl, apiKey, model, maxOutputTokens, llmTimeoutMs, undefined, llmTemperature, (detail) => reporter?.setProvider(detail), reasoningEffort);
         const useJsonMode = command === "review" && jsonResponseMode;
         // Only a user-configured effort earns a PR-visible "fix your config" notice; a rejected
         // default falls back quietly in the logs.
         const reasoningNoticeReason = () => reasoningEffortConfigured ? llm.getReasoningFallbackReason() : undefined;
         let reviewText;
+        let reviewStats;
         if (command === "summary") {
             reviewText = (await runSummary(llm, truncatedDiff)).content;
         }
         else {
-            reviewText = await runAgentOrSingleShotReview({
+            ({ content: reviewText, stats: reviewStats } = await runAgentOrSingleShotReview({
                 octokit,
                 owner,
                 repo,
@@ -2090,10 +2108,8 @@ async function run() {
                 useJsonMode,
                 agentMode,
                 agentMaxTurns,
-                onProgress: async (detail) => {
-                    await updateStatusComment(octokit, owner, repo, statusCommentId, buildProgressStatusBody(detail, statusCommand, statusModel));
-                },
-            });
+                reporter,
+            }));
         }
         if (command === "summary") {
             // Post summary as a regular comment
@@ -2103,6 +2119,7 @@ async function run() {
                 issue_number: prNumber,
                 body: ["## " + github_reviewer_1.ROBIN_SIGNATURE + " · Summary", "", reviewText].join("\n"),
             });
+            await reporter.close();
             await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("summary", undefined, reasoningNoticeReason()));
         }
         else {
@@ -2112,7 +2129,7 @@ async function run() {
             let findings = parsedReview.findings;
             if ((0, review_retry_1.shouldRetryStructuredReview)(findings, parsedReview.usedJson)) {
                 core.warning("Structured review parse was empty; retrying once with JSON-only instructions.");
-                await updateStatusComment(octokit, owner, repo, statusCommentId, buildProgressStatusBody("First pass returned no parseable findings — retrying with JSON-only instructions…", statusCommand, statusModel));
+                reporter.setStep("First pass returned no parseable findings — retrying with JSON-only instructions…");
                 const retryText = (await runReview(llm, truncatedDiff, `${reviewInstructions}\n\nReturn ONLY a single valid JSON object. Do not use markdown.`, true)).content;
                 parsedReview = review_parser_1.ReviewParser.parseDetailed(retryText);
                 findings = parsedReview.findings;
@@ -2120,7 +2137,8 @@ async function run() {
             core.info(`Found ${findings.high.length} high, ${findings.medium.length} medium, ${findings.low.length} low, ${findings.suggestions.length} suggestions`);
             const reviewer = new github_reviewer_1.GitHubReviewer(octokit, maxComments);
             await reviewer.postReview(owner, repo, prNumber, findings, requestChanges);
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("review", findings, reasoningNoticeReason()));
+            await reporter.close();
+            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("review", findings, reasoningNoticeReason(), reviewStats));
             if (findings.high.length > 0 && failOnHigh) {
                 core.setFailed(`Found ${findings.high.length} high severity issue(s). Failing check.`);
             }
@@ -2130,6 +2148,7 @@ async function run() {
     }
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        await reporter?.close();
         if (octokit && statusOwner && statusRepo && statusCommentId) {
             await updateStatusComment(octokit, statusOwner, statusRepo, statusCommentId, buildFailedStatusBody(message, statusCommand));
         }
@@ -2137,6 +2156,7 @@ async function run() {
     }
     finally {
         onJobCancelled = undefined;
+        await reporter?.close();
     }
 }
 async function addEyesReaction(octokit, owner, repo, commentId) {
@@ -2167,6 +2187,7 @@ async function postStatusComment(octokit, owner, repo, issueNumber, command, mod
                 "",
                 `Mode: ${command === "summary" ? "summary" : "code review"}`,
                 `Model: ${model}`,
+                `Robin: ${robinVersion}`,
             ].join("\n"),
         });
         return data.id;
@@ -2191,7 +2212,7 @@ async function updateStatusComment(octokit, owner, repo, commentId, body) {
         core.warning(`Could not update status comment: ${error}`);
     }
 }
-function buildCompletedStatusBody(command, findings, reasoningFallbackReason) {
+function buildCompletedStatusBody(command, findings, reasoningFallbackReason, reviewStats) {
     const fallbackNotice = (0, reasoning_fallback_1.buildReasoningFallbackNotice)(reasoningFallbackReason);
     if (command === "summary") {
         return [
@@ -2201,6 +2222,7 @@ function buildCompletedStatusBody(command, findings, reasoningFallbackReason) {
             ...(fallbackNotice ? ["", fallbackNotice] : []),
             "",
             "Want the full review? Comment `/robin`.",
+            ...versionFooter(),
         ].join("\n");
     }
     const totalFindings = findings
@@ -2216,6 +2238,7 @@ function buildCompletedStatusBody(command, findings, reasoningFallbackReason) {
         ...(fallbackNotice ? ["", fallbackNotice] : []),
         "",
         "Push fixes whenever you like, then comment `/robin` for another pass.",
+        ...versionFooter(reviewStats),
     ].join("\n");
 }
 function buildSkippedFilterStatusBody(removedFiles) {
@@ -2229,6 +2252,7 @@ function buildSkippedFilterStatusBody(removedFiles) {
         `Skipped: ${preview}${suffix}`,
         "",
         "Add `skip-paths` in `.github/robin.yml` if that's not what you expected.",
+        ...versionFooter(),
     ].join("\n");
 }
 function buildFailedStatusBody(errorMessage, command) {
@@ -2240,19 +2264,12 @@ function buildFailedStatusBody(errorMessage, command) {
         `Reason: ${errorMessage}`,
         "",
         "Free model routes drop sometimes — comment `/robin` to try again. (No secrets are included in this message.)",
+        ...versionFooter(),
     ].join("\n");
 }
-function buildProgressStatusBody(detail, command, model) {
-    return [
-        "## " + github_reviewer_1.ROBIN_SIGNATURE,
-        "",
-        ":hourglass_flowing_sand: Still working on this pull request.",
-        "",
-        detail,
-        "",
-        `Mode: ${command === "summary" ? "summary" : "code review"}`,
-        `Model: ${model}`,
-    ].join("\n");
+let robinVersion = "version unknown";
+function versionFooter(stats) {
+    return ["", `<sub>Robin ${robinVersion}${stats ? ` · ${stats}` : ""}</sub>`];
 }
 /**
  * True when a newer run of this same workflow exists — i.e. this run was
@@ -2296,6 +2313,7 @@ function buildSupersededStatusBody(command) {
         `:arrows_counterclockwise: This ${command === "summary" ? "summary" : "review"} run was replaced by a newer Robin run.`,
         "",
         "No action needed — the newer run posts its own result when it finishes.",
+        ...versionFooter(),
     ].join("\n");
 }
 function buildCancelledStatusBody(command) {
@@ -2307,6 +2325,7 @@ function buildCancelledStatusBody(command) {
         "This usually means the GitHub Actions job was cancelled or hit its time limit while waiting on the model.",
         "",
         "Comment `/robin` to run again.",
+        ...versionFooter(),
     ].join("\n");
 }
 function registerJobCancelHandler(onCancel) {
@@ -2417,36 +2436,34 @@ async function runReview(llm, diff, reviewInstructions, jsonResponseMode) {
 function truncateDiff(diff, limit) {
     return diff.length > limit ? diff.slice(0, limit) + "\n\n[... Diff truncated due to size limit]" : diff;
 }
-const AGENT_PROGRESS_MIN_INTERVAL_MS = 3000;
 /**
  * Multi-turn review with repository tools when possible; any failure to set it up or run it
  * (no tool support, snapshot download error, provider error mid-loop) falls back to the
- * single-shot diff review so a PR always gets a review.
+ * single-shot diff review so a PR always gets a review. `stats` describes how the review ran.
  */
 async function runAgentOrSingleShotReview(params) {
-    const singleShot = async () => (await runReview(params.llm, params.diff, params.reviewInstructions, params.useJsonMode)).content;
+    const { reporter } = params;
+    const singleShot = async (why) => {
+        reporter.setMode("code review (diff only)");
+        const { content } = await runReview(params.llm, params.diff, params.reviewInstructions, params.useJsonMode);
+        return { content, stats: `diff-only review (${why})` };
+    };
     if (params.agentMode === "off") {
         core.info("Agent mode is off; running single-shot diff review.");
-        return singleShot();
+        return singleShot("agent mode off");
     }
     let snapshot;
     try {
         const headSha = params.headSha || (await fetchHeadSha(params.octokit, params.owner, params.repo, params.prNumber));
-        await params.onProgress("Downloading the repository snapshot for context…");
+        reporter.setMode("code review (agent)");
+        reporter.setStep("Downloading the repository snapshot for context…");
         snapshot = await (0, repo_snapshot_1.createRepoSnapshot)(params.octokit, params.owner, params.repo, headSha);
     }
     catch (error) {
         core.warning(`Could not prepare repository snapshot (${error}); running single-shot diff review.`);
-        return singleShot();
+        reporter.setStep("Couldn't download the repository — running a diff-only review…");
+        return singleShot("repository snapshot unavailable");
     }
-    let lastProgressAt = 0;
-    const throttledProgress = async (detail) => {
-        const now = Date.now();
-        if (now - lastProgressAt < AGENT_PROGRESS_MIN_INTERVAL_MS)
-            return;
-        lastProgressAt = now;
-        await params.onProgress(detail);
-    };
     try {
         core.info(`Running agent review (max ${params.agentMaxTurns} turns)...`);
         const result = await (0, agent_review_1.runAgentReview)({
@@ -2456,20 +2473,24 @@ async function runAgentOrSingleShotReview(params) {
             changedFiles: params.changedFiles,
             instructions: params.reviewInstructions,
             budgets: { maxTurns: params.agentMaxTurns },
-            onProgress: throttledProgress,
+            onProgress: (progress) => reporter.setAgentProgress(progress),
         });
-        return result.content;
+        const plural = (count, noun) => `${count} ${noun}${count === 1 ? "" : "s"}`;
+        const compactions = result.compactions ? ` · ${plural(result.compactions, "compaction")}` : "";
+        return {
+            content: result.content,
+            stats: `agent review: ${plural(result.turns, "turn")} · ${plural(result.toolCalls, "tool call")}${compactions}`,
+        };
     }
     catch (error) {
         if (error instanceof llm_client_1.ToolsUnsupportedError) {
             core.warning(`${error.message}. Running single-shot diff review instead.`);
-            await params.onProgress("Model doesn't support tool calling — running a diff-only review…");
+            reporter.setStep("Model doesn't support tool calling — running a diff-only review…");
+            return singleShot("model has no tool support");
         }
-        else {
-            core.warning(`Agent review failed (${error}); running single-shot diff review instead.`);
-            await params.onProgress("Agent review failed — retrying as a diff-only review…");
-        }
-        return singleShot();
+        core.warning(`Agent review failed (${error}); running single-shot diff review instead.`);
+        reporter.setStep("Agent review failed — retrying as a diff-only review…");
+        return singleShot("agent review failed");
     }
     finally {
         await snapshot.cleanup();
@@ -3729,6 +3750,210 @@ function clampInt(value, min, max, fallback) {
     return Math.min(max, Math.max(min, Math.floor(parsed)));
 }
 //# sourceMappingURL=review-tools.js.map
+
+/***/ }),
+
+/***/ 7001:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.StatusReporter = void 0;
+exports.formatDuration = formatDuration;
+const github_reviewer_1 = __nccwpck_require__(268);
+/**
+ * Owns the in-progress status comment. Updates are coalesced (at most one edit per interval,
+ * with a trailing edit so the latest state always lands) and a heartbeat keeps elapsed times
+ * moving during long model calls. `close()` must run before a final status is written so a
+ * late progress edit cannot overwrite it.
+ */
+class StatusReporter {
+    write;
+    options;
+    startedAt;
+    mode;
+    step;
+    provider;
+    agent;
+    lastWriteAt = Number.NEGATIVE_INFINITY;
+    inFlight;
+    pending = false;
+    timer;
+    heartbeat;
+    closed = false;
+    constructor(write, options) {
+        this.write = write;
+        this.options = {
+            model: options.model,
+            version: options.version,
+            minIntervalMs: options.minIntervalMs ?? 3_000,
+            heartbeatMs: options.heartbeatMs ?? 30_000,
+            now: options.now ?? Date.now,
+        };
+        this.mode = options.mode;
+        this.startedAt = this.options.now();
+    }
+    setMode(mode) {
+        this.mode = mode;
+        this.schedule();
+    }
+    /** A one-off step outside the agent loop (snapshot download, fallback notice, JSON retry). */
+    setStep(detail) {
+        this.step = detail;
+        this.agent = undefined;
+        this.provider = undefined;
+        this.schedule();
+    }
+    /** Progress reported by the LLM client for the request in flight. */
+    setProvider(detail) {
+        this.provider = { detail, since: this.options.now() };
+        this.schedule();
+    }
+    setAgentProgress(progress) {
+        const activityChanged = this.agent?.activity !== progress.activity || this.agent?.phase !== progress.phase;
+        const since = activityChanged ? this.options.now() : this.agent.since;
+        this.agent = { ...progress, since };
+        this.step = undefined;
+        if (progress.phase !== "model")
+            this.provider = undefined;
+        this.schedule();
+    }
+    async close() {
+        this.closed = true;
+        if (this.timer)
+            clearTimeout(this.timer);
+        if (this.heartbeat)
+            clearInterval(this.heartbeat);
+        this.timer = undefined;
+        this.heartbeat = undefined;
+        await this.inFlight;
+    }
+    render() {
+        const now = this.options.now();
+        const lines = [
+            "## " + github_reviewer_1.ROBIN_SIGNATURE,
+            "",
+            `:hourglass_flowing_sand: Still working on this pull request · ${formatDuration(now - this.startedAt)} elapsed`,
+            "",
+        ];
+        if (this.agent) {
+            const agent = this.agent;
+            const compactions = agent.compactions
+                ? ` · ${agent.compactions} compaction${agent.compactions === 1 ? "" : "s"}`
+                : "";
+            lines.push(`**Agent:** turn ${agent.turn} of ${agent.maxTurns} · ${agent.toolCalls} tool call${agent.toolCalls === 1 ? "" : "s"}${compactions}`, `**Now:** ${agent.activity} (${formatDuration(now - agent.since)})`);
+        }
+        else if (this.step) {
+            lines.push(`**Now:** ${this.step}`);
+        }
+        if (this.provider) {
+            lines.push(`**Provider:** ${this.provider.detail} (${formatDuration(now - this.provider.since)})`);
+        }
+        lines.push("", `Mode: ${this.mode}`, `Model: ${this.options.model}`, `Robin: ${this.options.version()}`);
+        return lines.join("\n");
+    }
+    schedule() {
+        if (this.closed)
+            return;
+        this.startHeartbeat();
+        if (this.inFlight || this.timer) {
+            this.pending = true;
+            return;
+        }
+        const wait = this.lastWriteAt + this.options.minIntervalMs - this.options.now();
+        if (wait > 0) {
+            this.pending = true;
+            this.timer = setTimeout(() => {
+                this.timer = undefined;
+                this.flush();
+            }, wait);
+            this.timer.unref?.();
+            return;
+        }
+        this.flush();
+    }
+    flush() {
+        if (this.closed)
+            return;
+        this.pending = false;
+        this.lastWriteAt = this.options.now();
+        this.inFlight = this.write(this.render())
+            .catch(() => undefined)
+            .finally(() => {
+            this.inFlight = undefined;
+            if (this.pending)
+                this.schedule();
+        });
+    }
+    startHeartbeat() {
+        if (this.heartbeat || this.closed)
+            return;
+        this.heartbeat = setInterval(() => this.schedule(), this.options.heartbeatMs);
+        this.heartbeat.unref?.();
+    }
+}
+exports.StatusReporter = StatusReporter;
+function formatDuration(ms) {
+    const seconds = Math.max(0, Math.floor(ms / 1000));
+    if (seconds < 60)
+        return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
+//# sourceMappingURL=status-reporter.js.map
+
+/***/ }),
+
+/***/ 7913:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.readPackageVersion = readPackageVersion;
+exports.describeRobinVersion = describeRobinVersion;
+const fs_1 = __nccwpck_require__(9896);
+const path_1 = __nccwpck_require__(6928);
+/** Version from the action's own package.json (dist/ sits next to it at runtime). */
+function readPackageVersion(dir = __dirname) {
+    try {
+        const pkg = JSON.parse((0, fs_1.readFileSync)((0, path_1.join)(dir, "..", "package.json"), "utf8"));
+        return pkg?.name === "robin-review" && typeof pkg.version === "string" ? pkg.version : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * Human-readable identity of the running action, e.g. "v2.8.0 · yoeven/robin@main (9e6bb3d)".
+ * The commit is looked up best-effort because a branch ref like `main` doesn't say which
+ * commit the runner downloaded.
+ */
+async function describeRobinVersion(octokit, env = process.env, packageVersion = readPackageVersion(), timeoutMs = 3000) {
+    const version = packageVersion ? `v${packageVersion}` : "version unknown";
+    const repository = env.GITHUB_ACTION_REPOSITORY;
+    const ref = env.GITHUB_ACTION_REF;
+    if (!repository)
+        return `${version} · local action`;
+    const source = `${repository}@${ref || "?"}`;
+    const sha = ref ? await resolveCommit(octokit, repository, ref, timeoutMs) : undefined;
+    return sha ? `${version} · ${source} (${sha.slice(0, 7)})` : `${version} · ${source}`;
+}
+async function resolveCommit(octokit, repository, ref, timeoutMs) {
+    if (/^[0-9a-f]{40}$/i.test(ref))
+        return ref;
+    const [owner, repo] = repository.split("/");
+    if (!octokit || !owner || !repo)
+        return undefined;
+    const lookup = octokit.rest.repos
+        .getCommit({ owner, repo, ref })
+        .then(({ data }) => data.sha)
+        .catch(() => undefined);
+    const timeout = new Promise((resolve) => setTimeout(() => resolve(undefined), timeoutMs).unref());
+    return Promise.race([lookup, timeout]);
+}
+//# sourceMappingURL=version.js.map
 
 /***/ }),
 

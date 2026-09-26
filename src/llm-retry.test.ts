@@ -465,6 +465,12 @@ describe("findUnsupportedRequestParam", () => {
     ).toBe("max_tokens");
   });
 
+  it("matches Anthropic's deprecated-temperature rejection for newer Claude models", () => {
+    expect(
+      findUnsupportedRequestParam({ status: 400, message: "400 `temperature` is deprecated for this model." }, sent)
+    ).toBe("temperature");
+  });
+
   it("matches the live OpenAI messages without a structured param", () => {
     expect(
       findUnsupportedRequestParam(

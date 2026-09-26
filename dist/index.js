@@ -1717,7 +1717,7 @@ function structuredReasoningParam(error) {
     return typeof param === "string" && /\b(?:reasoning|effort|exclude)/i.test(param);
 }
 /** Rejection cues seen from OpenAI-compatible servers when a request key is not accepted. */
-const PARAM_REJECTION_CUES = /\b(?:unsupported|not\s+supported|does\s+not\s+support|do\s+not\s+support|not\s+allowed|not\s+permitted|unknown|unrecognized|unrecognised|unexpected|invalid|extra\s+(?:inputs?|fields?)|only\s+(?:the\s+)?default|only\s+\S+\s+is\s+allowed|must\s+be|should\s+be|instead)\b/i;
+const PARAM_REJECTION_CUES = /\b(?:unsupported|not\s+supported|no\s+longer\s+supported|deprecated|does\s+not\s+support|do\s+not\s+support|not\s+allowed|not\s+permitted|unknown|unrecognized|unrecognised|unexpected|invalid|extra\s+(?:inputs?|fields?)|only\s+(?:the\s+)?default|only\s+\S+\s+is\s+allowed|must\s+be|should\s+be|instead)\b/i;
 /**
  * Returns the first sent optional parameter that a 400/422 response rejects, or
  * undefined. Structured `param` (OpenAI SDK errors) wins; otherwise the message must
@@ -1725,6 +1725,7 @@ const PARAM_REJECTION_CUES = /\b(?:unsupported|not\s+supported|does\s+not\s+supp
  *   "Unsupported value: 'temperature' does not support 0.1 with this model."
  *   "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."
  *   "temperature must be 1 for reasoning models"
+ *   "`temperature` is deprecated for this model." (Anthropic, newer Claude models)
  * Dropping any of these is safe — the model falls back to its own defaults — so the
  * cue list is intentionally broad.
  */

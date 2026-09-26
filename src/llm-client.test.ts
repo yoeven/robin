@@ -222,21 +222,42 @@ describe("LLMClient unsupported parameter fallback", () => {
     expect(create.mock.calls[1][0]).not.toHaveProperty("max_completion_tokens");
   });
 
-  it("drops response_format when the provider does not support it", async () => {
+  it("steps down from the review JSON schema to JSON-object mode, then drops response_format", async () => {
     const client = makeClient("https://example.test/v1", "model");
+    const create = stubOpenAI(client);
+    const rejection = () =>
+      Object.assign(new Error("response_format is not supported by this model"), { status: 400 });
+    create
+      .mockRejectedValueOnce(rejection())
+      .mockRejectedValueOnce(rejection())
+      .mockResolvedValueOnce(completionResponse("review text"));
+
+    await client.chatCompletion("system", "user", true);
+
+    expect(create).toHaveBeenCalledTimes(3);
+    expect(create.mock.calls[0][0].response_format).toMatchObject({
+      type: "json_schema",
+      json_schema: { name: "robin_review", strict: true },
+    });
+    expect(create.mock.calls[1][0].response_format).toEqual({ type: "json_object" });
+    expect(create.mock.calls[2][0]).not.toHaveProperty("response_format");
+  });
+
+  it("drops a rejected schema straight away on Anthropic, which has no plain JSON mode", async () => {
+    const client = makeClient("https://api.anthropic.com/v1", "claude-opus-5-5");
     const create = stubOpenAI(client);
     create
       .mockRejectedValueOnce(
-        Object.assign(new Error("response_format is not supported by this model"), {
+        Object.assign(new Error("response_format.json_schema: structured outputs are not supported for this model"), {
           status: 400,
-        }),
+        })
       )
       .mockResolvedValueOnce(completionResponse("review text"));
 
     await client.chatCompletion("system", "user", true);
 
     expect(create).toHaveBeenCalledTimes(2);
-    expect(create.mock.calls[0][0]).toHaveProperty("response_format");
+    expect(create.mock.calls[0][0].response_format).toMatchObject({ type: "json_schema" });
     expect(create.mock.calls[1][0]).not.toHaveProperty("response_format");
   });
 
@@ -344,7 +365,7 @@ describe("LLMClient reasoning request shape", () => {
     expect(request).toMatchObject({
       model: "model",
       temperature: 0.1,
-      response_format: { type: "json_object" },
+      response_format: { type: "json_schema", json_schema: { name: "robin_review", strict: true } },
     });
     expect(request).not.toHaveProperty("max_tokens");
   });
@@ -980,5 +1001,26 @@ describe("LLMClient context-length errors on router streams", () => {
     );
 
     await expect(client.chatCompletion("system", "user")).rejects.toThrow(/maximum context length/);
+  });
+});
+
+describe("REVIEW_JSON_SCHEMA", () => {
+  const { REVIEW_JSON_SCHEMA } = jest.requireActual("./prompts/review-schema");
+
+  const objects = (schema: any): any[] =>
+    schema && typeof schema === "object"
+      ? [
+          ...(schema.type === "object" ? [schema] : []),
+          ...Object.values(schema).flatMap((value) => (Array.isArray(value) ? value.flatMap(objects) : objects(value))),
+        ]
+      : [];
+
+  it("satisfies OpenAI and Anthropic strict mode: closed objects with every property required", () => {
+    const all = objects(REVIEW_JSON_SCHEMA);
+    expect(all.length).toBeGreaterThan(1);
+    for (const object of all) {
+      expect(object.additionalProperties).toBe(false);
+      expect([...object.required].sort()).toEqual(Object.keys(object.properties).sort());
+    }
   });
 });

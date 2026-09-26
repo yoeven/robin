@@ -1,4 +1,5 @@
 import { OpenAI } from "openai";
+import { REVIEW_JSON_SCHEMA } from "./prompts/review-schema";
 import {
   DEFAULT_LLM_COMPLETION_ATTEMPTS,
   DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS,
@@ -93,7 +94,8 @@ export class LLMClient {
   private reasoningFallbackReason?: ReasoningFallbackReason;
   /** Request-shape compatibility state; adjusted once per rejected parameter and kept for the run. */
   private sendTemperature = true;
-  private sendResponseFormat = true;
+  /** JSON-mode shape: strict schema first, then plain JSON-object mode, then nothing. */
+  private responseFormat: "json_schema" | "json_object" | "none" = "json_schema";
   private tokenLimitParam: TokenLimitParam | undefined = "max_tokens";
   private droppedParams: DroppableRequestParam[] = [];
 
@@ -159,9 +161,6 @@ export class LLMClient {
           "Anthropic's OpenAI-compatible endpoint ignores reasoning-effort controls; reasoning-effort is not sent. Claude decides its own thinking depth."
         );
       }
-      core.info(
-        "Anthropic endpoint: response_format is ignored by the provider, so JSON mode relies on the prompt and the markdown fallback parser."
-      );
     }
   }
 
@@ -182,7 +181,16 @@ export class LLMClient {
    */
   private applyParameterFallback(error: unknown, request: ChatRequest): boolean {
     const param = findUnsupportedRequestParam(error, this.sentDroppableParams(request));
-    if (!param || this.droppedParams.includes(param)) return false;
+    if (!param) return false;
+    // Anthropic accepts only schema-constrained JSON, so there is no plain JSON mode to step down to.
+    if (param === "response_format" && this.responseFormat === "json_schema" && this.provider !== "anthropic") {
+      this.responseFormat = "json_object";
+      core.warning(
+        `Provider rejected the JSON schema response_format (${errorMessage(error)}). Retrying once with plain JSON-object mode and keeping that shape for the rest of this run.`
+      );
+      return true;
+    }
+    if (this.droppedParams.includes(param)) return false;
     this.droppedParams.push(param);
 
     let action: string;
@@ -200,7 +208,7 @@ export class LLMClient {
         action = "omitting the output token cap";
         break;
       case "response_format":
-        this.sendResponseFormat = false;
+        this.responseFormat = "none";
         action = "omitting response_format (the review parser falls back to markdown)";
         break;
     }
@@ -522,9 +530,15 @@ export class LLMClient {
       if (options.toolChoice) {
         request.tool_choice = options.toolChoice;
       }
-    } else if (options.jsonResponseMode && this.sendResponseFormat) {
+    } else if (options.jsonResponseMode && this.responseFormat !== "none") {
       // Many providers reject response_format combined with tools, so JSON mode is single-shot only.
-      request.response_format = { type: "json_object" };
+      request.response_format =
+        this.responseFormat === "json_schema"
+          ? {
+              type: "json_schema",
+              json_schema: { name: "robin_review", strict: true, schema: REVIEW_JSON_SCHEMA },
+            }
+          : { type: "json_object" };
     }
 
     if (this.reasoningEffort && !this.reasoningFallbackActive) {

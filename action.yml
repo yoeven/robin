@@ -85,7 +85,7 @@ inputs:
     required: false
     default: ""
   use-json-response-mode:
-    description: "Request JSON object responses when the provider supports response_format. Leave empty to use repo config or default true."
+    description: "Request strict JSON-schema review responses (falls back to JSON-object mode, then none, if the provider rejects it). Leave empty to use repo config or default true."
     required: false
     default: ""
 

@@ -131,7 +131,7 @@ Available on the [direct action](../action.yml) and the [reusable workflow](../.
 | `review-instructions` | empty | Extra prompt text |
 | `review-instructions-file` | `.github/code-reviewer.md` | Rules file on the base branch |
 | `config-file` | `.github/robin.yml` | Repo config path on the base branch |
-| `use-json-response-mode` | empty (defer to repo config, else true) | Request `response_format: json_object` when supported. Pass `"true"` / `"false"` on the reusable workflow |
+| `use-json-response-mode` | empty (defer to repo config, else true) | Request strict JSON-schema output (`response_format: json_schema`) for reviews, stepping down to `json_object` and then to no `response_format` if the provider rejects it. Pass `"true"` / `"false"` on the reusable workflow |
 | `agent-mode` | empty (defer to repo config, then `auto`) | `auto` lets the model read the repository with tools before reviewing, falling back to the single-shot diff review when the model has no tool support; `off` always uses the single-shot review |
 | `agent-max-turns` | empty (defer to repo config, then `40`) | Maximum tool-calling turns in agent mode (capped at 100) |
 | `agent-max-diff-size` | empty (defer to repo config, then `200000`) | Diff characters sent up front in agent mode. The model reads any truncated files with its tools; `max-diff-size` still applies to the single-shot fallback |
@@ -306,7 +306,7 @@ for the hosts below. Self-hosted and proxy URLs are passed through unchanged.
 | Provider | `LLM_BASE_URL` | Notes |
 | --- | --- | --- |
 | OpenAI | `https://api.openai.com/v1` | `reasoning-effort` is sent as OpenAI-native `reasoning_effort`. Reasoning models (`o1`, `o3`, `o4-mini`, `gpt-5*`, `codex-*`) are sent without `temperature` and with `max_completion_tokens` instead of `max_tokens`, because they reject both |
-| Anthropic (Claude) | `https://api.anthropic.com/v1` | Uses Anthropic's [OpenAI SDK compatibility](https://docs.anthropic.com/en/api/openai-sdk) endpoint with your regular Anthropic API key (`LLM_API_KEY`). `https://api.anthropic.com` without `/v1` is accepted. Anthropic ignores `response_format`, so JSON mode relies on the prompt plus the markdown fallback parser, and it ignores reasoning controls — Robin sends none there and Claude picks its own thinking depth. `temperature` above `1` is capped by Anthropic |
+| Anthropic (Claude) | `https://api.anthropic.com/v1` | Uses Anthropic's [OpenAI SDK compatibility](https://docs.anthropic.com/en/api/openai-sdk) endpoint with your regular Anthropic API key (`LLM_API_KEY`). `https://api.anthropic.com` without `/v1` is accepted. JSON mode sends Robin's review schema as `response_format: json_schema` (the only JSON mode Anthropic accepts; if a model rejects it, Robin drops it and relies on the prompt plus the markdown fallback parser). Anthropic ignores reasoning controls — Robin sends none there and Claude picks its own thinking depth. `temperature` above `1` is capped by Anthropic |
 | OpenRouter | `https://openrouter.ai/api/v1` | `reasoning-effort` uses the OpenRouter `reasoning: { effort, exclude }` object; router models get stall detection and provider fallbacks |
 | Anything else (Groq, Ollama, vLLM, gateways) | provider URL | Default request shape; unsupported parameters are recovered as described below |
 
@@ -318,9 +318,10 @@ Newer models refuse parameters older ones accepted — OpenAI reasoning models r
 400/422 response names one of the optional parameters Robin sent (`temperature`,
 `max_tokens`, `max_completion_tokens`, `response_format`), Robin logs a warning, adjusts
 that one parameter (omits `temperature`, switches `max_tokens` to
-`max_completion_tokens`, drops the token cap or `response_format`), re-sends once, and
-keeps the adjusted shape for the rest of the run. Each parameter is adjusted at most once
-per run, so a provider that keeps rejecting surfaces its real error instead of looping.
+`max_completion_tokens`, drops the token cap, or steps `response_format` down from `json_schema` to `json_object`
+and then drops it), re-sends once, and keeps the adjusted shape for the rest of the run.
+Each parameter is adjusted at most once per run (`response_format` gets its one extra
+step down), so a provider that keeps rejecting surfaces its real error instead of looping.
 Known OpenAI reasoning families skip the round trip and start with the right shape.
 
 Dropping these is safe: the model falls back to its own default sampling, and the review

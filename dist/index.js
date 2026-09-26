@@ -1045,6 +1045,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.LLMClient = exports.ToolsUnsupportedError = void 0;
 const openai_1 = __nccwpck_require__(2583);
+const review_schema_1 = __nccwpck_require__(665);
 const config_1 = __nccwpck_require__(4008);
 const llm_retry_1 = __nccwpck_require__(4069);
 const llm_provider_1 = __nccwpck_require__(710);
@@ -1071,7 +1072,8 @@ class LLMClient {
     reasoningFallbackReason;
     /** Request-shape compatibility state; adjusted once per rejected parameter and kept for the run. */
     sendTemperature = true;
-    sendResponseFormat = true;
+    /** JSON-mode shape: strict schema first, then plain JSON-object mode, then nothing. */
+    responseFormat = "json_schema";
     tokenLimitParam = "max_tokens";
     droppedParams = [];
     constructor(baseUrl, apiKey, model, maxOutputTokens, timeoutMs = config_1.DEFAULT_LLM_TIMEOUT_MS, maxAttempts = config_1.DEFAULT_LLM_COMPLETION_ATTEMPTS, temperature = config_1.DEFAULT_LLM_TEMPERATURE, onProgress, reasoningEffort) {
@@ -1112,7 +1114,6 @@ class LLMClient {
             if (this.reasoningEffort) {
                 core.info("Anthropic's OpenAI-compatible endpoint ignores reasoning-effort controls; reasoning-effort is not sent. Claude decides its own thinking depth.");
             }
-            core.info("Anthropic endpoint: response_format is ignored by the provider, so JSON mode relies on the prompt and the markdown fallback parser.");
         }
     }
     /** Optional parameters the current request shape includes, in fallback-check order. */
@@ -1135,7 +1136,15 @@ class LLMClient {
      */
     applyParameterFallback(error, request) {
         const param = (0, llm_retry_1.findUnsupportedRequestParam)(error, this.sentDroppableParams(request));
-        if (!param || this.droppedParams.includes(param))
+        if (!param)
+            return false;
+        // Anthropic accepts only schema-constrained JSON, so there is no plain JSON mode to step down to.
+        if (param === "response_format" && this.responseFormat === "json_schema" && this.provider !== "anthropic") {
+            this.responseFormat = "json_object";
+            core.warning(`Provider rejected the JSON schema response_format (${(0, llm_retry_1.errorMessage)(error)}). Retrying once with plain JSON-object mode and keeping that shape for the rest of this run.`);
+            return true;
+        }
+        if (this.droppedParams.includes(param))
             return false;
         this.droppedParams.push(param);
         let action;
@@ -1153,7 +1162,7 @@ class LLMClient {
                 action = "omitting the output token cap";
                 break;
             case "response_format":
-                this.sendResponseFormat = false;
+                this.responseFormat = "none";
                 action = "omitting response_format (the review parser falls back to markdown)";
                 break;
         }
@@ -1408,9 +1417,15 @@ class LLMClient {
                 request.tool_choice = options.toolChoice;
             }
         }
-        else if (options.jsonResponseMode && this.sendResponseFormat) {
+        else if (options.jsonResponseMode && this.responseFormat !== "none") {
             // Many providers reject response_format combined with tools, so JSON mode is single-shot only.
-            request.response_format = { type: "json_object" };
+            request.response_format =
+                this.responseFormat === "json_schema"
+                    ? {
+                        type: "json_schema",
+                        json_schema: { name: "robin_review", strict: true, schema: review_schema_1.REVIEW_JSON_SCHEMA },
+                    }
+                    : { type: "json_object" };
         }
         if (this.reasoningEffort && !this.reasoningFallbackActive) {
             if (this.provider === "openai") {
@@ -2729,6 +2744,49 @@ function getHelpMessage() {
     ].join("\n");
 }
 //# sourceMappingURL=review-prompts.js.map
+
+/***/ }),
+
+/***/ 665:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.REVIEW_JSON_SCHEMA = void 0;
+/**
+ * JSON Schema for the single-shot review object described in `reviewCriteriaAndFormat`.
+ * Kept inside the subset both OpenAI and Anthropic strict mode accept: every property is
+ * required (optional values are empty strings or null), every object closes with
+ * `additionalProperties: false`, and no numeric or string-length constraints are used.
+ */
+const FINDING_SCHEMA = {
+    type: "object",
+    properties: {
+        file: { type: "string" },
+        line: { anyOf: [{ type: "integer" }, { type: "null" }] },
+        category: { type: "string" },
+        confidence: { type: "string", enum: ["high", "medium", "low"] },
+        description: { type: "string" },
+        recommendation: { type: "string" },
+        codeSnippet: { type: "string" },
+    },
+    required: ["file", "line", "category", "confidence", "description", "recommendation", "codeSnippet"],
+    additionalProperties: false,
+};
+exports.REVIEW_JSON_SCHEMA = {
+    type: "object",
+    properties: {
+        summary: { type: "string" },
+        high: { type: "array", items: FINDING_SCHEMA },
+        medium: { type: "array", items: FINDING_SCHEMA },
+        low: { type: "array", items: FINDING_SCHEMA },
+        suggestions: { type: "array", items: FINDING_SCHEMA },
+    },
+    required: ["summary", "high", "medium", "low", "suggestions"],
+    additionalProperties: false,
+};
+//# sourceMappingURL=review-schema.js.map
 
 /***/ }),
 
